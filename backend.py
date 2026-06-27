@@ -3440,6 +3440,7 @@ async def excel_options(
     company_name: str = "",
     category: Optional[str] = None,
     form: Optional[str] = None,
+    refresh: bool = False,
 ):
     """Minimal, Excel-ready option-plan inputs for the Damodaran valuation
     workbook. Reuses the EXACT extraction pipeline behind
@@ -3450,6 +3451,12 @@ async def excel_options(
     US (SEC EDGAR) dual-form: when no explicit form is requested, the most
     recent 10-Q is tried FIRST and the 10-K is used only as a fallback (see the
     branch below). NON-US markets and explicit-form requests run once, unchanged.
+
+    Result cache: a successful response for a given input (ticker+country+
+    company_name+category+form) is cached for EXCEL_CACHE_TTL_SECONDS (default
+    7 days). A cache hit returns instantly — NO fetch, NO Stage 1/2/3, NO LLM
+    call. Error/credit failures are never cached. Pass ?refresh=true to force a
+    fresh run and overwrite the cached entry.
 
     NEVER 500s: on ANY failure it returns option_plans: [] plus an "error"
     field describing what happened."""
@@ -3466,11 +3473,57 @@ async def excel_options(
             return {"ticker": ticker, "currency": None, "option_plans": [],
                     "error": "country is required"}
 
+        # ── Endpoint result cache (skips fetch + Stage 1/2/3 + LLM entirely) ──
+        # Keyed by TICKER ONLY (per request): the same ticker returns the cached
+        # result regardless of country / company_name / category / form. Success-
+        # ful results (including a genuine "no options" empty) are cached for
+        # EXCEL_CACHE_TTL_SECONDS (default 7 days); error/credit failures are
+        # NEVER cached. A cache hit returns instantly with no LLM call.
+        # ?refresh=true forces a fresh run. Backed by NeonDB/Postgres (durable
+        # across Render restarts/deploys/idle spin-downs that wipe the local
+        # disk) with an automatic on-disk fallback — see excel_cache.py.
+        import excel_cache
+        _ttl = int(os.environ.get("EXCEL_CACHE_TTL_SECONDS", 7 * 24 * 3600))
+        _ckey = ("ticker-v1", ticker.upper())
+
+        def _finalize(payload):
+            # Cache only SUCCESSFUL results (no "error" key); never cache failures.
+            if "error" not in payload:
+                excel_cache.set(_ckey, payload)
+            return payload
+
+        def _cleanup_job(job_id):
+            # The excel endpoint only needs the in-memory result (already read by
+            # extract_from_options) + the cached payload — it never serves this
+            # job's PDF/extraction.json/.xlsx. So delete the throwaway job folder
+            # it created, to avoid filling the (ephemeral, free-tier) Render disk.
+            # These are jobs the EXCEL endpoint spawned; the normal UI flow uses
+            # its OWN job_ids and is unaffected.
+            if not job_id:
+                return
+            try:
+                d = get_job_dir(job_id)
+                if d and d.exists():
+                    shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
+            try:
+                JOBS.pop(job_id, None)
+            except Exception:
+                pass
+
+        if not refresh:
+            hit = excel_cache.get(_ckey, _ttl)
+            if hit is not None:
+                return hit
+
         async def _run(form_value):
             """Run the existing options pipeline ONCE for a given SEC form (or
             None to use that market's default). Reuses extract_from_options
             verbatim — same resolve/fetch/routing + Stages 1/2/3 (with caching).
-            Returns (result_dict_or_None, error_str_or_None); never raises."""
+            Returns (result_dict_or_None, error_str_or_None); never raises.
+            Deletes its throwaway job folder afterwards (success OR failure)."""
+            job_id = None
             try:
                 resp = await extract_from_options(OptionsExtractRequest(
                     ticker=ticker,
@@ -3479,6 +3532,8 @@ async def excel_options(
                     category=category,
                     form=form_value,
                 ))
+                if isinstance(resp, dict):
+                    job_id = resp.get("job_id")
                 res = resp.get("result", {}) if isinstance(resp, dict) else {}
                 if not isinstance(res, dict):
                     res = {}
@@ -3491,8 +3546,14 @@ async def excel_options(
                 return res, None
             except HTTPException as exc:
                 d = exc.detail
+                # A 502 from extract_from_options carries the failed job_id —
+                # grab it so its (partial) folder gets cleaned up too.
+                if isinstance(d, dict):
+                    job_id = d.get("job_id") or job_id
                 return None, (f"extraction failed ({exc.status_code}): "
                               f"{d if isinstance(d, str) else d}")
+            finally:
+                _cleanup_job(job_id)
 
         is_us = _OPTIONS_COUNTRY_TO_SOURCE.get(country_norm.lower()) == "edgar"
         explicit_form = bool((form or "").strip())
@@ -3510,9 +3571,9 @@ async def excel_options(
             result_q, _err_q = await _run("10-Q")
             plans_q = map_plans_to_excel(result_q or {})
             if plans_q:
-                return {"ticker": ticker,
-                        "currency": (result_q or {}).get("currency"),
-                        "option_plans": plans_q}
+                return _finalize({"ticker": ticker,
+                                  "currency": (result_q or {}).get("currency"),
+                                  "option_plans": plans_q})
             # No usable 10-Q option data -> use the 10-K instead.
             result_k, err_k = await _run("10-K")
             plans_k = map_plans_to_excel(result_k or {})
@@ -3521,16 +3582,16 @@ async def excel_options(
                    "option_plans": plans_k}
             if not plans_k and err_k:
                 out["error"] = err_k
-            return out
+            return _finalize(out)
 
         # ── Single run: non-US market, or an explicitly requested form ──
         result, err = await _run(form if explicit_form else None)
         if result is None:
-            return {"ticker": ticker, "currency": None, "option_plans": [],
-                    "error": err}
-        return {"ticker": ticker,
-                "currency": result.get("currency"),
-                "option_plans": map_plans_to_excel(result)}
+            return _finalize({"ticker": ticker, "currency": None,
+                              "option_plans": [], "error": err})
+        return _finalize({"ticker": ticker,
+                          "currency": result.get("currency"),
+                          "option_plans": map_plans_to_excel(result)})
 
     except HTTPException as exc:
         # extract_from_options raises HTTPException on bad input / fetch /
