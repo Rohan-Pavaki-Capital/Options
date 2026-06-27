@@ -1,0 +1,59 @@
+# ── Extraction pipeline ──────────────────────────────────────────────
+anthropic>=0.39.0
+openai>=1.40.0
+pymupdf>=1.24.0
+pypdf>=4.2.0
+python-dotenv>=1.0.0
+openpyxl>=3.1.2
+
+# ── Database (NeonDB / Postgres) ─────────────────────────────────────
+psycopg[binary]>=3.1.18
+
+# ── Backend API (FastAPI) ────────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
+aiofiles>=23.2.1
+pydantic>=2.5.0
+
+# ── EDGAR (SEC) ingestion ────────────────────────────────────────────
+edgartools>=2.30.0
+playwright>=1.44.0
+
+# ── UK (Companies House) ingestion ───────────────────────────────────
+requests>=2.31.0
+
+# ── Denmark (Erhvervsstyrelsen / CVR) ingestion ──────────────────────
+# No new dependency: reuses requests (above), playwright + pymupdf (above)
+# to render ESEF/iXBRL annual reports to PDF and OCR scanned filings.
+
+# ── Japan (FSA / EDINET) ingestion ───────────────────────────────────
+# edinet-python supplies the response model only; the v2 transport (which needs
+# a Subscription-Key) lives in japan_fetch.py. Code-list resolution reuses
+# requests (above).
+edinet-python>=0.1.18
+
+# ── South Korea (FSS / DART) ingestion ───────────────────────────────
+# dart-fss drives the live OpenDART API (needs a free DART_API_KEY) for corp
+# resolution + filing search; kr_fetch.py downloads the official report PDF
+# (or renders the viewer HTML via playwright, already a dependency above).
+dart-fss>=0.4.16
+
+# ── Brazil (CVM) ingestion ───────────────────────────────────────────
+# No new dependency and NO API key: br_resolve.py reads CVM's open-data
+# cadastral registry and br_fetch.py downloads the latest annual DFP package
+# (financial statements + notes) from dados.cvm.gov.br — both via requests
+# (above); pymupdf (above) handles the PDF.
+
+# ── Taiwan (TWSE / MOPS) ingestion ───────────────────────────────────
+# No new dependency and NO API key: tw_resolve.py reads TWSE's open-data
+# listed-company registry and tw_fetch.py downloads the latest annual
+# consolidated financial-statements PDF from doc.twse.com.tw — both via
+# requests (above).
+curl_cffi>=0.7
+
+# ── Simply Wall St forecast (/simply) ────────────────────────────────
+# Standalone feature in simply_route.py + Simply_wlst/data.py. No NEW
+# dependency: the scraper uses curl_cffi (above) to get past Cloudflare,
+# the Excel download uses openpyxl (above), and routing uses fastapi
+# (above). Listed here only to record the feature's requirements.

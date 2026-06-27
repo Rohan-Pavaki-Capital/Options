@@ -1,0 +1,40 @@
+services:
+  # ─── FastAPI Backend (Web Service) ─────────────────────────────────
+  - type: web
+    name: options-extractor-api
+    runtime: python
+    plan: free
+    region: oregon
+    rootDir: .
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn backend:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: TOGETHER_API_KEY
+        sync: false
+      - key: TOGETHER_MODEL
+        value: meta-llama/Llama-3.3-70B-Instruct-Turbo
+      - key: DATABASE_URL
+        sync: false
+      - key: CORS_ORIGIN_REGEX
+        value: "https://.*\\.onrender\\.com"
+
+  # ─── React/Vite Frontend (Static Site) ─────────────────────────────
+  - type: web
+    name: options-extractor-web
+    runtime: static
+    plan: free
+    rootDir: Frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_BASE
+        sync: false
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html

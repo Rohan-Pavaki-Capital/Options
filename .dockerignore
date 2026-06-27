@@ -1,0 +1,51 @@
+# Secrets — set these as Railway variables, never bake them into the image
+.env
+.env.local
+*.env
+
+# Frontend — not deployed on Railway (backend-only)
+Frontend/
+
+# VCS / editor
+.git
+.gitignore
+.vscode
+.idea
+
+# Python caches & local virtualenvs
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.rog/
+venv/
+env/
+.cache/
+
+# Local job/output artifacts (regenerated at runtime)
+jobs/
+output/
+downloads/
+_asia_e2e/
+
+# Local-only tooling
+cloudflared.exe
+
+# Bulky test fixtures & run logs (not needed at runtime)
+*.pdf
+*.xlsx
+*.log
+*.err
+*.out
+_test_*
+_ir_*
+_ca_*
+_cf_*
+_deploy_*
+tunnel_*
+backend_*
+cf_tunnel*
+
+# OS cruft
+.DS_Store
+Thumbs.db

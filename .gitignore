@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.rog/
+venv/
+env/
+
+# Env / secrets
+.env
+.env.local
+*.env
+
+# Project state
+.cache/
+jobs/
+output/
+
+# Node
+node_modules/
+Frontend/node_modules/
+Frontend/dist/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Large local fixtures & run artifacts (not needed in the repo or deploy)
+*.pdf
+*.xlsx
+*.log
+*.err
+*.out
+cloudflared.exe
+_asia_e2e/
+downloads/
+sws_url_cache.json
