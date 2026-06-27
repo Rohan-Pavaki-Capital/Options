@@ -3447,34 +3447,90 @@ async def excel_options(
     reduces the full plans[] to the four fields the workbook needs:
     count_mn, strike, maturity_years, kind.
 
+    US (SEC EDGAR) dual-form: when no explicit form is requested, the most
+    recent 10-Q is tried FIRST and the 10-K is used only as a fallback (see the
+    branch below). NON-US markets and explicit-form requests run once, unchanged.
+
     NEVER 500s: on ANY failure it returns option_plans: [] plus an "error"
     field describing what happened."""
     from excel_options import map_plans_to_excel
 
     ticker = (ticker or "").strip()
+    country_norm = (country or "").strip()
     currency = None
     try:
         if not ticker:
             return {"ticker": ticker, "currency": None, "option_plans": [],
                     "error": "ticker is required"}
-        if not (country or "").strip():
+        if not country_norm:
             return {"ticker": ticker, "currency": None, "option_plans": [],
                     "error": "country is required"}
 
-        # Reuse the existing options endpoint verbatim — same resolve/fetch/
-        # routing and the standard Stages 1/2/3 pipeline (with its caching).
-        resp = await extract_from_options(OptionsExtractRequest(
-            ticker=ticker,
-            company_name=company_name or "",
-            country=country,
-            category=category,
-            form=form,
-        ))
+        async def _run(form_value):
+            """Run the existing options pipeline ONCE for a given SEC form (or
+            None to use that market's default). Reuses extract_from_options
+            verbatim — same resolve/fetch/routing + Stages 1/2/3 (with caching).
+            Returns (result_dict_or_None, error_str_or_None); never raises."""
+            try:
+                resp = await extract_from_options(OptionsExtractRequest(
+                    ticker=ticker,
+                    company_name=company_name or "",
+                    country=country_norm,
+                    category=category,
+                    form=form_value,
+                ))
+                res = resp.get("result", {}) if isinstance(resp, dict) else {}
+                if not isinstance(res, dict):
+                    res = {}
+                # Stage-3 failures (e.g. Anthropic credit/API errors) come back
+                # as a result dict carrying an "error" key instead of raising —
+                # surface it as a real error so the response isn't a silent [].
+                if res.get("error"):
+                    detail = str(res.get("details") or "")[:300]
+                    return None, f"{res['error']}: {detail}".strip().rstrip(": ")
+                return res, None
+            except HTTPException as exc:
+                d = exc.detail
+                return None, (f"extraction failed ({exc.status_code}): "
+                              f"{d if isinstance(d, str) else d}")
 
-        result = resp.get("result", {}) if isinstance(resp, dict) else {}
-        currency = result.get("currency") if isinstance(result, dict) else None
-        option_plans = map_plans_to_excel(result)
-        return {"ticker": ticker, "currency": currency, "option_plans": option_plans}
+        is_us = _OPTIONS_COUNTRY_TO_SOURCE.get(country_norm.lower()) == "edgar"
+        explicit_form = bool((form or "").strip())
+
+        # ── US dual-form: prefer the most recent 10-Q, fall back to the 10-K ──
+        # Only when the caller did NOT pin a specific form. The 10-Q is tried
+        # first; run_extraction_pipeline raises at Stage 1/2 page-detection —
+        # BEFORE the Claude/Stage-3 LLM call — when a document has no relevant
+        # pages, so a 10-Q with no options data costs zero LLM spend and we fall
+        # straight through to the 10-K. Net effect: BOTH forms are page-checked,
+        # but only the winning document is ever sent to the LLM. (The lone
+        # exception — 10-Q pages that extract but map to no usable plans — is
+        # itself "no 10-Q options data", so falling back to the 10-K is correct.)
+        if is_us and not explicit_form:
+            result_q, _err_q = await _run("10-Q")
+            plans_q = map_plans_to_excel(result_q or {})
+            if plans_q:
+                return {"ticker": ticker,
+                        "currency": (result_q or {}).get("currency"),
+                        "option_plans": plans_q}
+            # No usable 10-Q option data -> use the 10-K instead.
+            result_k, err_k = await _run("10-K")
+            plans_k = map_plans_to_excel(result_k or {})
+            out = {"ticker": ticker,
+                   "currency": (result_k or {}).get("currency"),
+                   "option_plans": plans_k}
+            if not plans_k and err_k:
+                out["error"] = err_k
+            return out
+
+        # ── Single run: non-US market, or an explicitly requested form ──
+        result, err = await _run(form if explicit_form else None)
+        if result is None:
+            return {"ticker": ticker, "currency": None, "option_plans": [],
+                    "error": err}
+        return {"ticker": ticker,
+                "currency": result.get("currency"),
+                "option_plans": map_plans_to_excel(result)}
 
     except HTTPException as exc:
         # extract_from_options raises HTTPException on bad input / fetch /
