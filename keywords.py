@@ -273,6 +273,20 @@ ROLLFORWARD_PATTERNS = [
     r"exercisable\s*(?:at|as\s*at)\s*(?:the\s*)?(?:beginning|end|year[\s\-]*end)",
     r"vested\s*and\s*exercisable",
 
+    # ── Bare column-label activity verbs (US-GAAP) ──
+    # US-GAAP RSU/PSU/option roll-forward tables list activity as STANDALONE
+    # column rows ("Granted / Vested / Forfeited / Unvested, December 31, 2025")
+    # with no "during the year" suffix, so the precise patterns above miss them.
+    # These bare words are common, so they ONLY ever qualify a page via the
+    # "3+ roll-forward matches" rule (is_candidate): a real award table trips
+    # 4 of them at once, while a stray narrative sentence (1-2 hits) still needs
+    # a separate plan/section keyword to become a candidate.
+    r"\bgranted\b",
+    r"\bexercised\b",
+    r"\b(?:forfeited|cancelled|canceled|expired|lapsed|surrendered)\b",
+    r"\bvested\b",                     # matches "Vested" (not inside "unvested")
+    r"\b(?:un|non)[\s\-]?vested\b",    # opening/closing balance rows for RSUs
+
     # ── German roll-forward vocabulary ──
     # Opening balance
     r"(?:bestand|stand|ausstehend)\s*(?:am\s*anfang|zu\s*beginn|zum\s*beginn)\s*des\s*gesch(?:ä|ae)ftsjahr",
@@ -362,6 +376,12 @@ SECTION_HEADERS = [
     r"employee\s*share\s*(?:plans?|schemes?)",
     r"equity\s*(?:plans?|instruments?|compensation|incentive)",
     r"share\s*incentive\s*(?:plans?|schemes?)",
+    # US-GAAP award-table headings (require a numeric table). The roll-forward
+    # table is often headed only "Restricted Stock Awards"/"Restricted Stock
+    # Units" or "Nonvested Shares", with the formal SBC note title on an
+    # earlier page — these catch the table page itself.
+    r"restricted\s*stock\s*(?:awards?|units?)",
+    r"(?:un|non)[\s\-]*vested\s*(?:restricted\s*)?(?:shares?|stock|units?)",
 
     # German section headers (require a numeric table)
     r"anteilsbasierte[rn]?\s*verg(?:ü|ue)tung",

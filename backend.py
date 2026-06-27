@@ -3433,6 +3433,61 @@ async def extract_from_options(payload: OptionsExtractRequest):
     }
 
 
+@app.get("/api/excel/options")
+async def excel_options(
+    ticker: str = "",
+    country: str = "",
+    company_name: str = "",
+    category: Optional[str] = None,
+    form: Optional[str] = None,
+):
+    """Minimal, Excel-ready option-plan inputs for the Damodaran valuation
+    workbook. Reuses the EXACT extraction pipeline behind
+    POST /api/extract-from-options (same engine + same per-page caching), then
+    reduces the full plans[] to the four fields the workbook needs:
+    count_mn, strike, maturity_years, kind.
+
+    NEVER 500s: on ANY failure it returns option_plans: [] plus an "error"
+    field describing what happened."""
+    from excel_options import map_plans_to_excel
+
+    ticker = (ticker or "").strip()
+    currency = None
+    try:
+        if not ticker:
+            return {"ticker": ticker, "currency": None, "option_plans": [],
+                    "error": "ticker is required"}
+        if not (country or "").strip():
+            return {"ticker": ticker, "currency": None, "option_plans": [],
+                    "error": "country is required"}
+
+        # Reuse the existing options endpoint verbatim — same resolve/fetch/
+        # routing and the standard Stages 1/2/3 pipeline (with its caching).
+        resp = await extract_from_options(OptionsExtractRequest(
+            ticker=ticker,
+            company_name=company_name or "",
+            country=country,
+            category=category,
+            form=form,
+        ))
+
+        result = resp.get("result", {}) if isinstance(resp, dict) else {}
+        currency = result.get("currency") if isinstance(result, dict) else None
+        option_plans = map_plans_to_excel(result)
+        return {"ticker": ticker, "currency": currency, "option_plans": option_plans}
+
+    except HTTPException as exc:
+        # extract_from_options raises HTTPException on bad input / fetch /
+        # extraction failure. Surface it as an error field, not a 500.
+        detail = exc.detail
+        msg = detail if isinstance(detail, str) else str(detail)
+        return {"ticker": ticker, "currency": currency, "option_plans": [],
+                "error": f"extraction failed ({exc.status_code}): {msg}"}
+    except Exception as exc:  # absolute backstop — the no-failure mandate.
+        return {"ticker": ticker, "currency": currency, "option_plans": [],
+                "error": f"{type(exc).__name__}: {exc}"}
+
+
 @app.get("/api/job/{job_id}")
 async def get_job_status(job_id: str):
     if job_id not in JOBS:
