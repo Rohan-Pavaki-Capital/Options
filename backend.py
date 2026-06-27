@@ -3268,6 +3268,171 @@ async def extract_from_canada(
     }
 
 
+class OptionsExtractRequest(BaseModel):
+    # Unified entry point: company ticker + name + country. Routes to the SAME
+    # per-country handler the dedicated tabs use (so each market's exact
+    # resolve/fetch/fallback logic runs), then returns the final JSON in one call.
+    ticker: Optional[str] = ""
+    company_name: Optional[str] = ""
+    country: Optional[str] = ""
+    category: Optional[str] = None
+    form: Optional[str] = None   # only used when the country routes to US EDGAR
+
+
+# Normalized country name -> the source whose dedicated handler we delegate to.
+_OPTIONS_COUNTRY_TO_SOURCE = {
+    "united states": "edgar", "united states of america": "edgar",
+    "usa": "edgar", "us": "edgar", "u.s.": "edgar", "u.s.a.": "edgar", "america": "edgar",
+    "canada": "canada",
+    "united kingdom": "uk", "uk": "uk", "great britain": "uk",
+    "england": "uk", "britain": "uk", "scotland": "uk", "wales": "uk",
+    "denmark": "denmark",
+    "japan": "japan",
+    "south korea": "korea", "korea": "korea", "republic of korea": "korea",
+    "china": "china", "people's republic of china": "china",
+    "prc": "china", "mainland china": "china",
+    "hong kong": "hongkong", "hongkong": "hongkong",
+    "taiwan": "taiwan", "republic of china (taiwan)": "taiwan",
+    "india": "india",
+    "indonesia": "indonesia",
+    "israel": "israel",
+    "malaysia": "malaysia",
+    "thailand": "thailand",
+    "brazil": "brazil",
+    "germany": "germany",
+    "singapore": "singapore",
+    "mexico": "mexico",
+}
+
+# EU/EEA member states served by the pan-EU ESEF source (extract_from_eu).
+_OPTIONS_EU_COUNTRIES = {
+    "france", "netherlands", "the netherlands", "spain", "italy", "sweden", "finland",
+    "belgium", "austria", "portugal", "poland", "greece", "luxembourg", "norway",
+    "iceland", "croatia", "hungary", "romania", "slovakia", "slovenia", "estonia",
+    "latvia", "lithuania", "cyprus", "malta", "ireland", "bulgaria",
+    "czechia", "czech republic", "liechtenstein",
+}
+
+
+@app.post("/api/extract-from-options")
+async def extract_from_options(payload: OptionsExtractRequest):
+    """Single unified endpoint: take {ticker, company_name, country} and route to
+    the EXACT existing per-country handler (UK -> Companies House + IR fallback,
+    US -> EDGAR, EU members -> ESEF, etc.). No new fetch/routing logic — it
+    delegates to the dedicated handler, then runs the standard pipeline to
+    completion and returns the final extraction JSON in this one response."""
+    from fastapi.concurrency import run_in_threadpool
+
+    ticker = (payload.ticker or "").strip()
+    company_name = (payload.company_name or "").strip()
+    country = (payload.country or "").strip()
+    if not country:
+        raise HTTPException(status_code=400, detail="country is required")
+    if not ticker and not company_name:
+        raise HTTPException(
+            status_code=400, detail="ticker or company_name is required"
+        )
+
+    key = country.lower()
+    source = _OPTIONS_COUNTRY_TO_SOURCE.get(key)
+    if source is None and key in _OPTIONS_EU_COUNTRIES:
+        source = "eu"
+    if source is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported country {country!r}. Supported: United States, Canada, "
+                "United Kingdom, Denmark, Japan, South Korea, China, Hong Kong, "
+                "Taiwan, India, Indonesia, Israel, Malaysia, Thailand, Brazil, "
+                "Germany, Singapore, Mexico, and EU/EEA member states."
+            ),
+        )
+
+    # The dedicated handlers (defined above) — the SAME logic the dedicated tabs use.
+    dispatch = {
+        "edgar": (extract_from_edgar, EdgarExtractRequest),
+        "canada": (extract_from_canada, CaExtractRequest),
+        "uk": (extract_from_uk, UkExtractRequest),
+        "denmark": (extract_from_denmark, DkExtractRequest),
+        "japan": (extract_from_japan, JpExtractRequest),
+        "korea": (extract_from_korea, KrExtractRequest),
+        "china": (extract_from_china, CnExtractRequest),
+        "hongkong": (extract_from_hongkong, HkExtractRequest),
+        "taiwan": (extract_from_taiwan, TwExtractRequest),
+        "india": (extract_from_india, InExtractRequest),
+        "indonesia": (extract_from_indonesia, IdExtractRequest),
+        "israel": (extract_from_israel, IlExtractRequest),
+        "malaysia": (extract_from_malaysia, MyExtractRequest),
+        "thailand": (extract_from_thailand, ThExtractRequest),
+        "brazil": (extract_from_brazil, BrExtractRequest),
+        "germany": (extract_from_germany, GermanyExtractRequest),
+        "singapore": (extract_from_singapore, SingaporeExtractRequest),
+        "mexico": (extract_from_mexico, MexicoExtractRequest),
+        "eu": (extract_from_eu, EuExtractRequest),
+    }
+    handler, Model = dispatch[source]
+
+    # Build the chosen handler's request payload from the common fields. Only the
+    # fields each model actually supports are set; missing ones use that model's
+    # own defaults (e.g. UK -> "accounts", others -> "annual").
+    kwargs = {"ticker": ticker, "company_name": company_name or None}
+    category = (payload.category or "").strip() or None
+    if Model is EdgarExtractRequest:
+        kwargs["form"] = (payload.form or "10-K")
+    else:
+        if category:
+            kwargs["category"] = category
+    if Model is EuExtractRequest:
+        kwargs["country"] = country
+
+    # Delegate to the dedicated handler: it runs that market's real validation +
+    # resolution + job creation. We hand it a throwaway BackgroundTasks so it
+    # registers the pipeline task without firing it, then we run the pipeline
+    # synchronously below so this single call can return the final JSON.
+    try:
+        delegated = await handler(Model(**kwargs), BackgroundTasks())
+    except HTTPException:
+        raise
+    job_id = delegated["job_id"]
+
+    # Run the standard extraction pipeline to completion (blocking; off the event
+    # loop). The per-source Stage 0 fetch + Stages 1/2/3 all run here.
+    await run_in_threadpool(run_extraction_pipeline, job_id)
+
+    job = JOBS.get(job_id, {})
+    if job.get("status") == "failed":
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "job_id": job_id,
+                "source": source,
+                "error": job.get("error"),
+                "error_code": job.get("error_code"),
+                "error_context": job.get("error_context"),
+            },
+        )
+
+    json_path = get_job_dir(job_id) / "extraction.json"
+    if not json_path.exists():
+        raise HTTPException(
+            status_code=500,
+            detail=f"Extraction produced no result (job {job_id})",
+        )
+    with open(json_path, "r", encoding="utf-8") as f:
+        result = json.load(f)
+
+    return {
+        "job_id": job_id,
+        "status": "completed",
+        "source": source,
+        "country": country,
+        "ticker": ticker,
+        "company_name": company_name,
+        "extraction_id": job.get("extraction_id"),
+        "result": result,
+    }
+
+
 @app.get("/api/job/{job_id}")
 async def get_job_status(job_id: str):
     if job_id not in JOBS:
