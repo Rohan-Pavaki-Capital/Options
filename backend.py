@@ -3277,6 +3277,7 @@ class OptionsExtractRequest(BaseModel):
     country: Optional[str] = ""
     category: Optional[str] = None
     form: Optional[str] = None   # only used when the country routes to US EDGAR
+    refresh: bool = False        # force a fresh run, bypassing the ticker cache
 
 
 # Normalized country name -> the source whose dedicated handler we delegate to.
@@ -3320,7 +3321,22 @@ async def extract_from_options(payload: OptionsExtractRequest):
     the EXACT existing per-country handler (UK -> Companies House + IR fallback,
     US -> EDGAR, EU members -> ESEF, etc.). No new fetch/routing logic — it
     delegates to the dedicated handler, then runs the standard pipeline to
-    completion and returns the final extraction JSON in this one response."""
+    completion and returns the final extraction JSON in this one response.
+
+    Result cache: a successful response is cached (durable NeonDB, disk fallback)
+    keyed by TICKER only for EXCEL_CACHE_TTL_SECONDS (default 7 days). A repeat
+    request for the same ticker returns instantly — NO fetch, NO Stage 1/2/3, NO
+    LLM (so it uses almost no memory). Failures are never cached. Pass
+    {"refresh": true} to force a fresh run and overwrite the cached entry."""
+    return await _extract_from_options_core(payload, use_cache=True)
+
+
+async def _extract_from_options_core(
+    payload: OptionsExtractRequest, use_cache: bool = True
+):
+    """Core of the options endpoint. `use_cache` controls the ticker result cache;
+    internal callers (e.g. the excel endpoint's dual-form 10-Q/10-K runs) pass
+    use_cache=False so the ticker-only cache never returns the wrong form."""
     from fastapi.concurrency import run_in_threadpool
 
     ticker = (payload.ticker or "").strip()
@@ -3371,6 +3387,21 @@ async def extract_from_options(payload: OptionsExtractRequest):
         "eu": (extract_from_eu, EuExtractRequest),
     }
     handler, Model = dispatch[source]
+
+    # ── Ticker-keyed result cache (durable NeonDB, on-disk fallback) ──
+    # A repeat request for the SAME ticker returns the stored full response,
+    # skipping fetch + Stage 1/2/3 + LLM entirely (so it uses almost no memory).
+    # Internal callers (the excel endpoint's dual-form runs) pass use_cache=False
+    # to bypass, since this key ignores form and would otherwise cross the
+    # 10-Q/10-K results. Only successful results are cached (below); failures
+    # never are. ?refresh forces a fresh run.
+    import excel_cache
+    _cache_ttl = int(os.environ.get("EXCEL_CACHE_TTL_SECONDS", 7 * 24 * 3600))
+    _cache_key = ("options-full-v1", ticker.upper())
+    if use_cache and ticker and not payload.refresh:
+        _hit = excel_cache.get(_cache_key, _cache_ttl)
+        if _hit is not None:
+            return _hit
 
     # Build the chosen handler's request payload from the common fields. Only the
     # fields each model actually supports are set; missing ones use that model's
@@ -3429,7 +3460,7 @@ async def extract_from_options(payload: OptionsExtractRequest):
     with open(json_path, "r", encoding="utf-8") as f:
         result = json.load(f)
 
-    return {
+    out = {
         "job_id": job_id,
         "status": "completed",
         "source": source,
@@ -3439,9 +3470,17 @@ async def extract_from_options(payload: OptionsExtractRequest):
         "extraction_id": job.get("extraction_id"),
         "result": result,
     }
+    # Cache only successful results, keyed by ticker (never cache failures — the
+    # failure paths above raise HTTPException before reaching here).
+    if use_cache and ticker:
+        try:
+            excel_cache.set(_cache_key, out)
+        except Exception:
+            pass
+    return out
 
 
-@app.get("/api/excel/options", include_in_schema=False)
+@app.get("/api/excel/options")
 async def excel_options(
     ticker: str = "",
     country: str = "",
@@ -3533,13 +3572,13 @@ async def excel_options(
             Deletes its throwaway job folder afterwards (success OR failure)."""
             job_id = None
             try:
-                resp = await extract_from_options(OptionsExtractRequest(
+                resp = await _extract_from_options_core(OptionsExtractRequest(
                     ticker=ticker,
                     company_name=company_name or "",
                     country=country_norm,
                     category=category,
                     form=form_value,
-                ))
+                ), use_cache=False)
                 if isinstance(resp, dict):
                     job_id = resp.get("job_id")
                 res = resp.get("result", {}) if isinstance(resp, dict) else {}
