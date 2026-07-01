@@ -2057,7 +2057,7 @@ app.add_middleware(
 )
 
 
-@app.get("/api/health")
+@app.get("/api/health", include_in_schema=False)
 async def health():
     return {"status": "healthy", "active_jobs": len(JOBS)}
 
@@ -2144,7 +2144,7 @@ class DiamondExtractRequest(BaseModel):
     country: Optional[str] = ""
 
 
-@app.post("/api/extract-from-diamond")
+@app.post("/api/extract-from-diamond", include_in_schema=False)
 async def extract_from_diamond(
     payload: DiamondExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2193,7 +2193,7 @@ class SingaporeExtractRequest(BaseModel):
     category: Optional[str] = "annual"
 
 
-@app.post("/api/extract-from-singapore")
+@app.post("/api/extract-from-singapore", include_in_schema=False)
 async def extract_from_singapore(
     payload: SingaporeExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2253,7 +2253,7 @@ class MexicoExtractRequest(BaseModel):
     category: Optional[str] = "annual"
 
 
-@app.post("/api/extract-from-mexico")
+@app.post("/api/extract-from-mexico", include_in_schema=False)
 async def extract_from_mexico(
     payload: MexicoExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2313,7 +2313,7 @@ class ScrapeTestRequest(BaseModel):
     category: Optional[str] = "annual"
 
 
-@app.post("/api/scrape-test")
+@app.post("/api/scrape-test", include_in_schema=False)
 async def scrape_test(
     payload: ScrapeTestRequest,
     background_tasks: BackgroundTasks,
@@ -2360,7 +2360,7 @@ class UkExtractRequest(BaseModel):
     category: str = "accounts"
 
 
-@app.post("/api/extract-from-uk")
+@app.post("/api/extract-from-uk", include_in_schema=False)
 async def extract_from_uk(
     payload: UkExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2426,7 +2426,7 @@ class DkExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-denmark")
+@app.post("/api/extract-from-denmark", include_in_schema=False)
 async def extract_from_denmark(
     payload: DkExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2491,7 +2491,7 @@ class JpExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-japan")
+@app.post("/api/extract-from-japan", include_in_schema=False)
 async def extract_from_japan(
     payload: JpExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2556,7 +2556,7 @@ class KrExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-korea")
+@app.post("/api/extract-from-korea", include_in_schema=False)
 async def extract_from_korea(
     payload: KrExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2610,7 +2610,7 @@ class BrExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-brazil")
+@app.post("/api/extract-from-brazil", include_in_schema=False)
 async def extract_from_brazil(
     payload: BrExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2662,7 +2662,7 @@ class TwExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-taiwan")
+@app.post("/api/extract-from-taiwan", include_in_schema=False)
 async def extract_from_taiwan(
     payload: TwExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2711,7 +2711,7 @@ class CnExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-china")
+@app.post("/api/extract-from-china", include_in_schema=False)
 async def extract_from_china(
     payload: CnExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2760,7 +2760,7 @@ class InExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-india")
+@app.post("/api/extract-from-india", include_in_schema=False)
 async def extract_from_india(
     payload: InExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2809,7 +2809,7 @@ class HkExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-hongkong")
+@app.post("/api/extract-from-hongkong", include_in_schema=False)
 async def extract_from_hongkong(
     payload: HkExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2858,7 +2858,7 @@ class IdExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-indonesia")
+@app.post("/api/extract-from-indonesia", include_in_schema=False)
 async def extract_from_indonesia(
     payload: IdExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2903,7 +2903,7 @@ class IlExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-israel")
+@app.post("/api/extract-from-israel", include_in_schema=False)
 async def extract_from_israel(
     payload: IlExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2954,7 +2954,7 @@ class MyExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-malaysia")
+@app.post("/api/extract-from-malaysia", include_in_schema=False)
 async def extract_from_malaysia(
     payload: MyExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2989,7 +2989,7 @@ class ThExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-thailand")
+@app.post("/api/extract-from-thailand", include_in_schema=False)
 async def extract_from_thailand(
     payload: ThExtractRequest,
     background_tasks: BackgroundTasks,
@@ -3029,7 +3029,7 @@ class EuExtractRequest(BaseModel):
     isin: Optional[str] = None
 
 
-@app.get("/api/eu-search")
+@app.get("/api/eu-search", include_in_schema=False)
 async def eu_search(q: str, limit: int = 10):
     """Autocomplete for the EU/EEA (ESEF) tab. Returns companies that actually
     have a downloadable ESEF report on filings.xbrl.org whose name matches `q`,
@@ -3044,7 +3044,7 @@ async def eu_search(q: str, limit: int = 10):
     return {"query": query, "results": results}
 
 
-@app.get("/api/gurufocus-resolve")
+@app.get("/api/gurufocus-resolve", include_in_schema=False)
 async def gurufocus_resolve(url: str):
     """EU tab: turn a GuruFocus stock URL (e.g.
     https://www.gurufocus.com/stock/OSL:AUSS/summary) into the pipeline inputs —
@@ -3060,7 +3060,7 @@ async def gurufocus_resolve(url: str):
         raise HTTPException(status_code=502, detail=f"GuruFocus resolve failed: {e}")
 
 
-@app.post("/api/extract-from-eu")
+@app.post("/api/extract-from-eu", include_in_schema=False)
 async def extract_from_eu(
     payload: EuExtractRequest,
     background_tasks: BackgroundTasks,
@@ -3121,7 +3121,7 @@ async def extract_from_eu(
     }
 
 
-@app.post("/api/eu-try-alternate/{job_id}")
+@app.post("/api/eu-try-alternate/{job_id}", include_in_schema=False)
 async def eu_try_alternate(job_id: str, background_tasks: BackgroundTasks):
     """EU tab only: re-run extraction on the interim/quarterly report the scraper
     already downloaded for `job_id`, when its annual report had no option data
@@ -3177,7 +3177,7 @@ class GermanyExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-germany")
+@app.post("/api/extract-from-germany", include_in_schema=False)
 async def extract_from_germany(
     payload: GermanyExtractRequest,
     background_tasks: BackgroundTasks,
@@ -3227,7 +3227,7 @@ class CaExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-canada")
+@app.post("/api/extract-from-canada", include_in_schema=False)
 async def extract_from_canada(
     payload: CaExtractRequest,
     background_tasks: BackgroundTasks,
@@ -3376,9 +3376,17 @@ async def extract_from_options(payload: OptionsExtractRequest):
     # fields each model actually supports are set; missing ones use that model's
     # own defaults (e.g. UK -> "accounts", others -> "annual").
     kwargs = {"ticker": ticker, "company_name": company_name or None}
-    category = (payload.category or "").strip() or None
+    # Ignore the Swagger/OpenAPI placeholder value "string" that clients often
+    # leave in optional fields — treat it as unset so real defaults apply.
+    category = (payload.category or "").strip()
+    if category.lower() == "string":
+        category = ""
+    category = category or None
+    form = (payload.form or "").strip()
+    if form.lower() == "string":
+        form = ""
     if Model is EdgarExtractRequest:
-        kwargs["form"] = (payload.form or "10-K")
+        kwargs["form"] = (form or "10-K")
     else:
         if category:
             kwargs["category"] = category
@@ -3433,7 +3441,7 @@ async def extract_from_options(payload: OptionsExtractRequest):
     }
 
 
-@app.get("/api/excel/options")
+@app.get("/api/excel/options", include_in_schema=False)
 async def excel_options(
     ticker: str = "",
     country: str = "",
@@ -3605,7 +3613,7 @@ async def excel_options(
                 "error": f"{type(exc).__name__}: {exc}"}
 
 
-@app.get("/api/job/{job_id}")
+@app.get("/api/job/{job_id}", include_in_schema=False)
 async def get_job_status(job_id: str):
     if job_id not in JOBS:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -3624,7 +3632,7 @@ async def get_job_status(job_id: str):
     return job
 
 
-@app.get("/api/result/{job_id}")
+@app.get("/api/result/{job_id}", include_in_schema=False)
 async def get_result(job_id: str):
     # Like the Excel download: fall back to the on-disk result if the in-memory job
     # record was lost to a backend restart.
@@ -3646,7 +3654,7 @@ async def get_result(job_id: str):
         return json.load(f)
 
 
-@app.get("/api/download/{job_id}/excel")
+@app.get("/api/download/{job_id}/excel", include_in_schema=False)
 async def download_excel(job_id: str):
     # Serve from disk even if the in-memory job record is gone (e.g. the backend was
     # restarted) — the generated workbook persists under jobs/<id>/. Only block the
@@ -3671,7 +3679,7 @@ async def download_excel(job_id: str):
     )
 
 
-@app.get("/api/download/{job_id}/pdf")
+@app.get("/api/download/{job_id}/pdf", include_in_schema=False)
 async def download_pdf(job_id: str):
     """Serve the fetched source PDF (used by the TESTING tab). Served from disk
     so it works even if the in-memory job record was lost to a restart."""
@@ -3704,7 +3712,7 @@ async def download_pdf(job_id: str):
     )
 
 
-@app.delete("/api/job/{job_id}")
+@app.delete("/api/job/{job_id}", include_in_schema=False)
 async def cancel_job(job_id: str):
     if job_id not in JOBS:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -3717,7 +3725,7 @@ async def cancel_job(job_id: str):
     return {"status": "cancelled", "job_id": job_id}
 
 
-@app.get("/api/jobs")
+@app.get("/api/jobs", include_in_schema=False)
 async def list_jobs():
     return {
         "total": len(JOBS),
