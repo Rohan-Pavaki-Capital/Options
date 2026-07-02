@@ -21,7 +21,7 @@ import re
 import sys
 import time
 
-import cache
+from core import cache
 from Anthropic.prompt import SYSTEM_PROMPT, EXTRACTION_PROMPT, VALIDATION_PROMPT
 from Anthropic.schema import OUTPUT_SCHEMA
 

@@ -26,7 +26,12 @@ env/
 jobs/
 output/
 downloads/
-_asia_e2e/
+logs/
+test_data/
+
+# Docs & local helper scripts — not needed in the image
+docs/
+scripts/
 
 # Local-only tooling
 cloudflared.exe

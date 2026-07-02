@@ -35,6 +35,7 @@ Thumbs.db
 *.err
 *.out
 cloudflared.exe
-_asia_e2e/
+logs/
+test_data/
 downloads/
 sws_url_cache.json

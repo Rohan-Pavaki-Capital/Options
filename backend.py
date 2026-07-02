@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import cache
+from core import cache
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,7 +44,7 @@ except ImportError:
     pass
 
 # ── Pipeline modules (live at project root) ──────────────────────────
-from options import (
+from core.options import (
     detect_relevant_pages,
     extract_text_from_pages,
     rasterize_pages,
@@ -59,41 +59,41 @@ from Anthropic import (
 )
 from format.json_to_excel import build_workbook
 from database.storage import save_extraction
-from edgar_fetch import fetch_filing_as_pdf
-from companies_house_fetch import fetch_filing_as_pdf as fetch_uk_filing_as_pdf
-from uk_resolve import resolve_company_number
-from denmark_fetch import fetch_filing_as_pdf as fetch_dk_filing_as_pdf
-from dk_resolve import resolve_company_number as resolve_dk_company_number
-from japan_fetch import fetch_filing_as_pdf as fetch_jp_filing_as_pdf
-from jp_resolve import resolve_company_number as resolve_jp_company_number
-from kr_fetch import fetch_filing_as_pdf as fetch_kr_filing_as_pdf
-from kr_resolve import resolve_company_number as resolve_kr_company_number
-from br_fetch import fetch_filing_as_pdf as fetch_br_filing_as_pdf
-from br_resolve import resolve_company_number as resolve_br_company_number
-from tw_fetch import fetch_filing_as_pdf as fetch_tw_filing_as_pdf
-from tw_resolve import resolve_company_number as resolve_tw_company_number
-from eu_fetch import fetch_filing_as_pdf as fetch_eu_filing_as_pdf
-from eu_resolve import (
+from markets.edgar_fetch import fetch_filing_as_pdf
+from markets.companies_house_fetch import fetch_filing_as_pdf as fetch_uk_filing_as_pdf
+from markets.uk_resolve import resolve_company_number
+from markets.denmark_fetch import fetch_filing_as_pdf as fetch_dk_filing_as_pdf
+from markets.dk_resolve import resolve_company_number as resolve_dk_company_number
+from markets.japan_fetch import fetch_filing_as_pdf as fetch_jp_filing_as_pdf
+from markets.jp_resolve import resolve_company_number as resolve_jp_company_number
+from markets.kr_fetch import fetch_filing_as_pdf as fetch_kr_filing_as_pdf
+from markets.kr_resolve import resolve_company_number as resolve_kr_company_number
+from markets.br_fetch import fetch_filing_as_pdf as fetch_br_filing_as_pdf
+from markets.br_resolve import resolve_company_number as resolve_br_company_number
+from markets.tw_fetch import fetch_filing_as_pdf as fetch_tw_filing_as_pdf
+from markets.tw_resolve import resolve_company_number as resolve_tw_company_number
+from markets.eu_fetch import fetch_filing_as_pdf as fetch_eu_filing_as_pdf
+from markets.eu_resolve import (
     resolve_company_number as resolve_eu_company_number,
     search_companies as search_eu_companies,
 )
-from ca_fetch import fetch_filing_as_pdf as fetch_ca_filing_as_pdf
-from cn_fetch import fetch_filing_as_pdf as fetch_cn_filing_as_pdf
-from cn_resolve import resolve_company_number as resolve_cn_company_number
-from in_fetch import fetch_filing_as_pdf as fetch_in_filing_as_pdf
-from in_resolve import resolve_company_number as resolve_in_company_number
-from hk_fetch import fetch_filing_as_pdf as fetch_hk_filing_as_pdf
-from hk_resolve import resolve_company_number as resolve_hk_company_number
-from id_fetch import fetch_filing_as_pdf as fetch_id_filing_as_pdf
-from il_fetch import fetch_filing_as_pdf as fetch_il_filing_as_pdf
-from il_resolve import resolve_company_number as resolve_il_company_number
-from my_fetch import fetch_filing_as_pdf as fetch_my_filing_as_pdf
-from my_resolve import resolve_company_number as resolve_my_company_number
-from th_fetch import fetch_filing_as_pdf as fetch_th_filing_as_pdf
-from th_resolve import resolve_company_number as resolve_th_company_number
-import diamond_route
-import fc_client
-import gurufocus
+from markets.ca_fetch import fetch_filing_as_pdf as fetch_ca_filing_as_pdf
+from markets.cn_fetch import fetch_filing_as_pdf as fetch_cn_filing_as_pdf
+from markets.cn_resolve import resolve_company_number as resolve_cn_company_number
+from markets.in_fetch import fetch_filing_as_pdf as fetch_in_filing_as_pdf
+from markets.in_resolve import resolve_company_number as resolve_in_company_number
+from markets.hk_fetch import fetch_filing_as_pdf as fetch_hk_filing_as_pdf
+from markets.hk_resolve import resolve_company_number as resolve_hk_company_number
+from markets.id_fetch import fetch_filing_as_pdf as fetch_id_filing_as_pdf
+from markets.il_fetch import fetch_filing_as_pdf as fetch_il_filing_as_pdf
+from markets.il_resolve import resolve_company_number as resolve_il_company_number
+from markets.my_fetch import fetch_filing_as_pdf as fetch_my_filing_as_pdf
+from markets.my_resolve import resolve_company_number as resolve_my_company_number
+from markets.th_fetch import fetch_filing_as_pdf as fetch_th_filing_as_pdf
+from markets.th_resolve import resolve_company_number as resolve_th_company_number
+from routes import diamond_route
+from core import fc_client
+from routes import gurufocus
 
 import anthropic
 from openai import OpenAI
@@ -935,8 +935,8 @@ def run_extraction_pipeline(job_id: str):
                 _interim_pdf = job_dir / f"{pdf_stem}_interim.pdf"
 
                 def _eu_scrape_both():
-                    import ir_resolve_proto as _R
-                    import ir_fetch_proto as _F
+                    from prototypes import ir_resolve_proto as _R
+                    from prototypes import ir_fetch_proto as _F
                     _res = _R.resolve(_ir_name or "", _ir_ticker or "", "",
                                       _ir_country or "")
                     _url = _res.get("chosen_url")
@@ -1049,7 +1049,7 @@ def run_extraction_pipeline(job_id: str):
                 # Claude entirely. The period comes from a cheap index lookup (no render),
                 # so a newer fiscal year naturally misses the cache and re-extracts.
                 try:
-                    from eu_fetch import _latest_filing as _eu_latest_filing
+                    from markets.eu_fetch import _latest_filing as _eu_latest_filing
                     _period = (_eu_latest_filing(lei).get("period_end") or "").strip()
                 except Exception:
                     _period = ""
@@ -3440,7 +3440,7 @@ async def _extract_from_options_core(
     # to bypass, since this key ignores form and would otherwise cross the
     # 10-Q/10-K results. Only successful results are cached (below); failures
     # never are. ?refresh forces a fresh run.
-    import excel_cache
+    from core import excel_cache
     _cache_ttl = int(os.environ.get("EXCEL_CACHE_TTL_SECONDS", 7 * 24 * 3600))
     _cache_key = ("options-full-v1", ticker.upper())
     if use_cache and ticker and not payload.refresh:
@@ -3612,7 +3612,7 @@ async def excel_options(
 
     NEVER 500s: on ANY failure it returns option_plans: [] plus an "error"
     field describing what happened."""
-    from excel_options import map_plans_to_excel
+    from core.excel_options import map_plans_to_excel
 
     ticker = (ticker or "").strip()
     country_norm = (country or "").strip()
@@ -3634,7 +3634,7 @@ async def excel_options(
         # ?refresh=true forces a fresh run. Backed by NeonDB/Postgres (durable
         # across Render restarts/deploys/idle spin-downs that wipe the local
         # disk) with an automatic on-disk fallback — see excel_cache.py.
-        import excel_cache
+        from core import excel_cache
         _ttl = int(os.environ.get("EXCEL_CACHE_TTL_SECONDS", 7 * 24 * 3600))
         _ckey = ("ticker-v1", ticker.upper())
 
@@ -3890,7 +3890,7 @@ async def list_jobs():
 # Separate from the options pipeline. Adds GET /simply (+ /api/simply,
 # /api/simply/excel). Included BEFORE the StaticFiles catch-all below so
 # the /simply route isn't swallowed by the SPA mount.
-from simply_route import router as simply_router
+from routes.simply_route import router as simply_router
 app.include_router(simply_router)
 
 
