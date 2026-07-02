@@ -34,7 +34,7 @@ from core import cache
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 try:
@@ -3515,19 +3515,11 @@ class FetchFilingRequest(BaseModel):
     form: Optional[str] = None   # only used when the country routes to US EDGAR
 
 
-@app.post("/api/fetch-filing")
-async def fetch_filing(payload: FetchFilingRequest):
-    """Single endpoint returning the MOST RECENT filing PDF for a company —
-    the PDF file itself, in this one response.
-
-    Takes {ticker, company_name, country}, routes to the exact per-market
-    resolve/fetch logic (Korea -> DART A001, China -> CNINFO annual report,
-    etc.), runs ONLY the fetch (no Stage 1/2/3, no LLM cost), and streams back
-    the fetched PDF. For the US with no explicit `form`, the truly latest
-    filing wins — 10-Q or 10-K, whichever was filed most recently. Blocks
-    until the fetch completes — slow markets (e.g. Korea's cold ~90s corp-list
-    resolve) can exceed proxy timeouts like Cloudflare quick-tunnels' ~100s
-    edge limit; call directly (not through the tunnel) for those."""
+async def _fetch_filing_pdf(payload: FetchFilingRequest):
+    """Shared fetch-only flow behind /api/fetch-filing and
+    /api/balance-sheet/standardize: route to the per-market handler, create a
+    fetch_only job, run the fetch synchronously (no Stage 1/2/3, no LLM).
+    Returns (job_id, pdf_path, job); raises HTTPException on failure."""
     from fastapi.concurrency import run_in_threadpool
 
     source, handler, Model, kwargs, ticker, company_name, country = (
@@ -3546,7 +3538,7 @@ async def fetch_filing(payload: FetchFilingRequest):
                    "validation", "excel_generation"):
         JOBS[job_id]["stages"].pop(_stage, None)
 
-    # Run the fetch to completion (off the event loop) and return the PDF.
+    # Run the fetch to completion (off the event loop).
     await run_in_threadpool(run_extraction_pipeline, job_id)
 
     job = JOBS.get(job_id, {})
@@ -3569,6 +3561,24 @@ async def fetch_filing(payload: FetchFilingRequest):
             detail=f"Fetch produced no PDF (job {job_id})",
         )
 
+    return job_id, pdf_path, job
+
+
+@app.post("/api/fetch-filing")
+async def fetch_filing(payload: FetchFilingRequest):
+    """Single endpoint returning the MOST RECENT filing PDF for a company —
+    the PDF file itself, in this one response.
+
+    Takes {ticker, company_name, country}, routes to the exact per-market
+    resolve/fetch logic (Korea -> DART A001, China -> CNINFO annual report,
+    etc.), runs ONLY the fetch (no Stage 1/2/3, no LLM cost), and streams back
+    the fetched PDF. For the US with no explicit `form`, the truly latest
+    filing wins — 10-Q or 10-K, whichever was filed most recently. Blocks
+    until the fetch completes — slow markets (e.g. Korea's cold ~90s corp-list
+    resolve) can exceed proxy timeouts like Cloudflare quick-tunnels' ~100s
+    edge limit; call directly (not through the tunnel) for those."""
+    job_id, pdf_path, job = await _fetch_filing_pdf(payload)
+
     # For US "LATEST" runs the fetch records which form actually won (10-K vs
     # 10-Q) — use it in the download name instead of the LATEST placeholder.
     download_name = pdf_path.name
@@ -3583,6 +3593,28 @@ async def fetch_filing(payload: FetchFilingRequest):
         filename=download_name,
         media_type="application/pdf",
     )
+
+
+@app.post("/api/balance-sheet/standardize")
+async def balance_sheet_standardize(payload: FetchFilingRequest):
+    """Fetch the company's most recent filing (same inputs + same per-market
+    routing as /api/fetch-filing: {ticker, company_name, country, form?}) and
+    run the Balance_sheet standardization pipeline on the fetched PDF —
+    locate the balance-sheet pages (PyMuPDF), parse them to markdown
+    (LlamaParse), map into the fixed Damodaran-style schema (Together LLM),
+    and tally against the filing's printed totals. One call: input fields in,
+    final standardized JSON out. Blocks through fetch + parse + LLM — same
+    proxy-timeout caveat as /api/fetch-filing for slow markets."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from Balance_sheet.pipeline import run_pipeline as run_balance_sheet
+
+    job_id, pdf_path, job = await _fetch_filing_pdf(payload)
+
+    # The pipeline itself never crashes — failures come back as JSON with
+    # "warnings" (and an "error" field), which we pass through to the caller.
+    result = await run_in_threadpool(run_balance_sheet, str(pdf_path))
+    return JSONResponse(content=result)
 
 
 @app.get("/api/excel/options")
