@@ -1726,6 +1726,13 @@ def run_extraction_pipeline(job_id: str):
                             f"{info.get('form','?')} · period {info.get('report_period','?')}"
                         ))
 
+        # ── Fetch-only jobs stop here: the most-recent filing PDF is on disk
+        # (download via /api/download/{job_id}/pdf). No Stage 1/2/3, no LLM.
+        if job.get("fetch_only"):
+            update_job(job_id, status="completed", progress=100,
+                       current_stage=None, result_available=False)
+            return
+
         # ── Stage 1 + 2: page detection ────────────────────────────
         update_job(job_id, status="processing",
                    current_stage="stage1_keywords", progress=5)
@@ -3315,30 +3322,16 @@ _OPTIONS_EU_COUNTRIES = {
 }
 
 
-@app.post("/api/extract-from-options")
-async def extract_from_options(payload: OptionsExtractRequest):
-    """Single unified endpoint: take {ticker, company_name, country} and route to
-    the EXACT existing per-country handler (UK -> Companies House + IR fallback,
-    US -> EDGAR, EU members -> ESEF, etc.). No new fetch/routing logic — it
-    delegates to the dedicated handler, then runs the standard pipeline to
-    completion and returns the final extraction JSON in this one response.
+def _route_options_request(payload, edgar_default_form: str = "10-K"):
+    """Shared routing for the unified endpoints: validate {ticker, company_name,
+    country}, pick the market source, and build the dedicated handler's request
+    kwargs. Returns (source, handler, Model, kwargs, ticker, company_name,
+    country). Raises HTTPException on missing/unsupported input. Pure — no job
+    is created and nothing is fetched here.
 
-    Result cache: a successful response is cached (durable NeonDB, disk fallback)
-    keyed by TICKER only for EXCEL_CACHE_TTL_SECONDS (default 7 days). A repeat
-    request for the same ticker returns instantly — NO fetch, NO Stage 1/2/3, NO
-    LLM (so it uses almost no memory). Failures are never cached. Pass
-    {"refresh": true} to force a fresh run and overwrite the cached entry."""
-    return await _extract_from_options_core(payload, use_cache=True)
-
-
-async def _extract_from_options_core(
-    payload: OptionsExtractRequest, use_cache: bool = True
-):
-    """Core of the options endpoint. `use_cache` controls the ticker result cache;
-    internal callers (e.g. the excel endpoint's dual-form 10-Q/10-K runs) pass
-    use_cache=False so the ticker-only cache never returns the wrong form."""
-    from fastapi.concurrency import run_in_threadpool
-
+    `edgar_default_form` is the US form used when the payload gives none:
+    "10-K" for the extraction endpoints; the fetch-filing endpoint passes
+    "LATEST" (newest of 10-K/10-Q, resolved in edgar_fetch)."""
     ticker = (payload.ticker or "").strip()
     company_name = (payload.company_name or "").strip()
     country = (payload.country or "").strip()
@@ -3388,21 +3381,6 @@ async def _extract_from_options_core(
     }
     handler, Model = dispatch[source]
 
-    # ── Ticker-keyed result cache (durable NeonDB, on-disk fallback) ──
-    # A repeat request for the SAME ticker returns the stored full response,
-    # skipping fetch + Stage 1/2/3 + LLM entirely (so it uses almost no memory).
-    # Internal callers (the excel endpoint's dual-form runs) pass use_cache=False
-    # to bypass, since this key ignores form and would otherwise cross the
-    # 10-Q/10-K results. Only successful results are cached (below); failures
-    # never are. ?refresh forces a fresh run.
-    import excel_cache
-    _cache_ttl = int(os.environ.get("EXCEL_CACHE_TTL_SECONDS", 7 * 24 * 3600))
-    _cache_key = ("options-full-v1", ticker.upper())
-    if use_cache and ticker and not payload.refresh:
-        _hit = excel_cache.get(_cache_key, _cache_ttl)
-        if _hit is not None:
-            return _hit
-
     # Build the chosen handler's request payload from the common fields. Only the
     # fields each model actually supports are set; missing ones use that model's
     # own defaults (e.g. UK -> "accounts", others -> "annual").
@@ -3417,12 +3395,58 @@ async def _extract_from_options_core(
     if form.lower() == "string":
         form = ""
     if Model is EdgarExtractRequest:
-        kwargs["form"] = (form or "10-K")
+        kwargs["form"] = (form or edgar_default_form)
     else:
         if category:
             kwargs["category"] = category
     if Model is EuExtractRequest:
         kwargs["country"] = country
+
+    return source, handler, Model, kwargs, ticker, company_name, country
+
+
+@app.post("/api/extract-from-options")
+async def extract_from_options(payload: OptionsExtractRequest):
+    """Single unified endpoint: take {ticker, company_name, country} and route to
+    the EXACT existing per-country handler (UK -> Companies House + IR fallback,
+    US -> EDGAR, EU members -> ESEF, etc.). No new fetch/routing logic — it
+    delegates to the dedicated handler, then runs the standard pipeline to
+    completion and returns the final extraction JSON in this one response.
+
+    Result cache: a successful response is cached (durable NeonDB, disk fallback)
+    keyed by TICKER only for EXCEL_CACHE_TTL_SECONDS (default 7 days). A repeat
+    request for the same ticker returns instantly — NO fetch, NO Stage 1/2/3, NO
+    LLM (so it uses almost no memory). Failures are never cached. Pass
+    {"refresh": true} to force a fresh run and overwrite the cached entry."""
+    return await _extract_from_options_core(payload, use_cache=True)
+
+
+async def _extract_from_options_core(
+    payload: OptionsExtractRequest, use_cache: bool = True
+):
+    """Core of the options endpoint. `use_cache` controls the ticker result cache;
+    internal callers (e.g. the excel endpoint's dual-form 10-Q/10-K runs) pass
+    use_cache=False so the ticker-only cache never returns the wrong form."""
+    from fastapi.concurrency import run_in_threadpool
+
+    source, handler, Model, kwargs, ticker, company_name, country = (
+        _route_options_request(payload)
+    )
+
+    # ── Ticker-keyed result cache (durable NeonDB, on-disk fallback) ──
+    # A repeat request for the SAME ticker returns the stored full response,
+    # skipping fetch + Stage 1/2/3 + LLM entirely (so it uses almost no memory).
+    # Internal callers (the excel endpoint's dual-form runs) pass use_cache=False
+    # to bypass, since this key ignores form and would otherwise cross the
+    # 10-Q/10-K results. Only successful results are cached (below); failures
+    # never are. ?refresh forces a fresh run.
+    import excel_cache
+    _cache_ttl = int(os.environ.get("EXCEL_CACHE_TTL_SECONDS", 7 * 24 * 3600))
+    _cache_key = ("options-full-v1", ticker.upper())
+    if use_cache and ticker and not payload.refresh:
+        _hit = excel_cache.get(_cache_key, _cache_ttl)
+        if _hit is not None:
+            return _hit
 
     # Delegate to the dedicated handler: it runs that market's real validation +
     # resolution + job creation. We hand it a throwaway BackgroundTasks so it
@@ -3478,6 +3502,87 @@ async def _extract_from_options_core(
         except Exception:
             pass
     return out
+
+
+class FetchFilingRequest(BaseModel):
+    # Fetch-only entry point: {ticker, company_name, country} -> most recent
+    # filing PDF via the same per-country routing as /api/extract-from-options,
+    # but stops after the fetch (no Stage 1/2/3, no LLM).
+    ticker: Optional[str] = ""
+    company_name: Optional[str] = ""
+    country: Optional[str] = ""
+    category: Optional[str] = None
+    form: Optional[str] = None   # only used when the country routes to US EDGAR
+
+
+@app.post("/api/fetch-filing")
+async def fetch_filing(payload: FetchFilingRequest):
+    """Single endpoint returning the MOST RECENT filing PDF for a company —
+    the PDF file itself, in this one response.
+
+    Takes {ticker, company_name, country}, routes to the exact per-market
+    resolve/fetch logic (Korea -> DART A001, China -> CNINFO annual report,
+    etc.), runs ONLY the fetch (no Stage 1/2/3, no LLM cost), and streams back
+    the fetched PDF. For the US with no explicit `form`, the truly latest
+    filing wins — 10-Q or 10-K, whichever was filed most recently. Blocks
+    until the fetch completes — slow markets (e.g. Korea's cold ~90s corp-list
+    resolve) can exceed proxy timeouts like Cloudflare quick-tunnels' ~100s
+    edge limit; call directly (not through the tunnel) for those."""
+    from fastapi.concurrency import run_in_threadpool
+
+    source, handler, Model, kwargs, ticker, company_name, country = (
+        _route_options_request(payload, edgar_default_form="LATEST")
+    )
+
+    # Delegate to the dedicated handler with a throwaway BackgroundTasks so it
+    # creates the job (running its real validation/resolution) without starting
+    # the pipeline; we run the fetch synchronously below.
+    delegated = await handler(Model(**kwargs), BackgroundTasks())
+    job_id = delegated["job_id"]
+
+    JOBS[job_id]["fetch_only"] = True
+    # Drop the extraction stages from the job record — they will never run.
+    for _stage in ("stage1_keywords", "stage2_classifier", "stage3_extraction",
+                   "validation", "excel_generation"):
+        JOBS[job_id]["stages"].pop(_stage, None)
+
+    # Run the fetch to completion (off the event loop) and return the PDF.
+    await run_in_threadpool(run_extraction_pipeline, job_id)
+
+    job = JOBS.get(job_id, {})
+    if job.get("status") == "failed":
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "job_id": job_id,
+                "source": source,
+                "error": job.get("error"),
+                "error_code": job.get("error_code"),
+                "error_context": job.get("error_context"),
+            },
+        )
+
+    pdf_path = get_job_dir(job_id) / job.get("filename", "")
+    if not pdf_path.exists():
+        raise HTTPException(
+            status_code=500,
+            detail=f"Fetch produced no PDF (job {job_id})",
+        )
+
+    # For US "LATEST" runs the fetch records which form actually won (10-K vs
+    # 10-Q) — use it in the download name instead of the LATEST placeholder.
+    download_name = pdf_path.name
+    actual_form = ((job.get("source_meta") or {}).get("form") or "").strip()
+    if "LATEST" in download_name and actual_form and actual_form != "LATEST":
+        download_name = download_name.replace(
+            "LATEST", actual_form.replace("/", "-")
+        )
+
+    return FileResponse(
+        path=pdf_path,
+        filename=download_name,
+        media_type="application/pdf",
+    )
 
 
 @app.get("/api/excel/options")

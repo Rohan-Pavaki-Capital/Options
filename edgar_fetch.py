@@ -119,18 +119,29 @@ def _html_to_pdf(html: str, out_pdf_path: Path) -> None:
             browser.close()
 
 
+# Sentinel form value: pick the single newest filing across these form types
+# (annual vs quarterly, whichever was filed most recently).
+_LATEST_FORMS = ["10-K", "10-Q"]
+
+
 def fetch_filing_as_pdf(
     ticker: str,
     form: str,
     out_pdf_path: str | Path,
 ) -> dict[str, Any]:
-    """Fetch latest `form` filing for `ticker`, write PDF, return metadata."""
+    """Fetch latest `form` filing for `ticker`, write PDF, return metadata.
+
+    `form="LATEST"` fetches the most recent filing across 10-K and 10-Q;
+    the returned metadata's `form` then reflects the actual filing type."""
     ticker = _normalize_ticker(ticker)
     form = (form or "10-K").strip().upper()
 
     _ensure_identity()
     company = _resolve_company(ticker)
-    filing = _latest_filing(company, form)
+    query_form = _LATEST_FORMS if form == "LATEST" else form
+    filing = _latest_filing(company, query_form)
+    if form == "LATEST":
+        form = str(getattr(filing, "form", "") or "") or "LATEST"
 
     html = _filing_html(filing)
     out_pdf_path = Path(out_pdf_path)
