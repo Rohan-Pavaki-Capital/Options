@@ -71,7 +71,6 @@ Balance_sheet/
   tally.py           Stage 4: coercion, exact sums, balance booleans, gap diagnosis, sanity guard
   pipeline.py        orchestrates stages 1-4, re-prompt + per-side merge, never crashes
   api.py             standalone FastAPI app (local path / upload input)
-  requirements.txt   PyMuPDF, llama-parse, openai, python-dotenv, fastapi, uvicorn, python-multipart
   README.md          package-level quick reference
   test_sample.py     documented acceptance tests (DHC + Apple)
 ```
@@ -84,7 +83,7 @@ The one-call endpoint lives in the main `backend.py` (see §7), reusing the exac
 ## 3. Setup
 
 ```bash
-pip install -r Balance_sheet/requirements.txt
+pip install -r requirements.txt   # project-root requirements (adds llama-parse)
 ```
 
 `.env` in the project root (loaded with python-dotenv — keys are never hardcoded):

@@ -25,7 +25,7 @@ def _import_llamaparse():
         except ImportError as exc:
             raise RuntimeError(
                 "llama-parse is not installed - run "
-                "'pip install -r Balance_sheet/requirements.txt'."
+                "'pip install -r requirements.txt' (project root)."
             ) from exc
     return LlamaParse
 

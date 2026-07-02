@@ -57,3 +57,10 @@ curl_cffi>=0.7
 # dependency: the scraper uses curl_cffi (above) to get past Cloudflare,
 # the Excel download uses openpyxl (above), and routing uses fastapi
 # (above). Listed here only to record the feature's requirements.
+
+# ── Balance-sheet standardizer (Balance_sheet/) ──────────────────────
+# PDF page location uses pymupdf (above), the standardization LLM uses
+# openai (above, Together AI endpoint), API/serving uses fastapi/uvicorn/
+# python-multipart (above), .env via python-dotenv (above). Only NEW
+# dependency: LlamaParse for PDF -> markdown table parsing.
+llama-parse>=0.5

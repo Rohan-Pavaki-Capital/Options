@@ -29,7 +29,7 @@ liabilities tally (they're outside the printed "Total liabilities").
 ## Setup
 
 ```bash
-pip install -r Balance_sheet/requirements.txt
+pip install -r requirements.txt   # project-root requirements (adds llama-parse)
 ```
 
 Add to the project-root `.env` (never hardcoded):
