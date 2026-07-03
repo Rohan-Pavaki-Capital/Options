@@ -14,6 +14,7 @@ from .config import (
     ASSET_NON_CURRENT_KEYS,
     LIABILITY_CURRENT_KEYS,
     LIABILITY_NON_CURRENT_KEYS,
+    PLUG_SUSPICIOUS_GAP,
     TALLY_TOLERANCE,
 )
 
@@ -274,6 +275,16 @@ def apply_deterministic_plug(result: dict) -> dict:
         gap = result["tally"][f"sum_{side}"] - result["filing_totals"][f"total_{side}"]
         if abs(gap) <= TALLY_TOLERANCE:
             continue
+        if abs(gap) <= PLUG_SUSPICIOUS_GAP:
+            # A correct mapping ties exactly — a small residual is the
+            # signature of a wrong-bucket mis-map, not rounding.
+            result["warnings"].append(
+                f"LIKELY WRONG-BUCKET MAPPING ({side}): the remaining gap is "
+                f"only {abs(gap):,} — a correct mapping should tie exactly, "
+                f"so a small residual means a line was placed in the wrong "
+                f"bucket (not rounding). The plug is applied below, but the "
+                f"bucket breakdown needs review."
+            )
         other_key = "other_assets" if side == "assets" else "other_liabilities"
         if gap < 0:
             # Buckets fall short — add the shortfall to the non-current other_* bucket.
@@ -299,6 +310,36 @@ def apply_deterministic_plug(result: dict) -> dict:
                 f"{printed_label} (buckets exceeded the printed total)."
             )
     return run_tally(result)
+
+
+_EQUITY_ADJACENT_TERMS = {
+    "preferred_stock": ("preferred",),
+    "mezzanine_equity": ("mezzanine", "redeemable", "temporary equity", "preferred"),
+}
+
+
+def guard_equity_adjacent_buckets(result: dict, line_items: list) -> dict:
+    """Code guard: preferred_stock / mezzanine_equity may only hold the value
+    of a printed line actually labeled as such (preferred / redeemable /
+    mezzanine / temporary equity). The LLM keeps sneaking ordinary equity
+    lines (e.g. NIKE "Class B common stock at stated value" = 3) into
+    mezzanine_equity despite the prompt rules — zero it and warn. These
+    buckets sit outside the liabilities tally, so this never changes sums."""
+    for bucket, terms in _EQUITY_ADJACENT_TERMS.items():
+        value = result["liabilities"].get(bucket)
+        if not value:
+            continue
+        matching = [v for label, v in line_items
+                    if any(t in label.lower() for t in terms)]
+        if value in matching or (matching and sum(matching) == value):
+            continue
+        result["warnings"].append(
+            f"Removed {value:,} from {bucket}: no printed line labeled "
+            f"preferred/redeemable/mezzanine/temporary equity carries that "
+            f"value - it was an ordinary equity line (kept out of all buckets)."
+        )
+        result["liabilities"][bucket] = 0
+    return result
 
 
 def sanity_check_other_buckets(result: dict) -> dict:

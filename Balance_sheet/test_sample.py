@@ -38,6 +38,22 @@ summed to 36,958 (gap -165,035) and the service returned it unbalanced.
 (2) mapping-quality regression: the LLM then swept current items + intangibles
 + the custodial asset into NON-current other_assets (197,672) and put operating
 property (355.4) into real_estate_assets — tally passed but placement was wrong.
+
+NIKE 10-Q, February 28 2026 (dollars in millions) — debt-split regression
+(markdown fixture, Stages 3-4 only; balance sheet transcribed from the filing):
+    current.debt == 999 (current portion of LT debt; notes payable 0)
+    non_current.long_term_debt == 7,030
+    accounts_trade_payable == 2,888 ; current.lease_liabilities == 493
+    other_current_liabilities == 6,458 (accrued 6,183 + income taxes payable 275)
+    non_current.lease_liabilities == 2,656
+    non_current.deferred_rev_and_tax == 2,450 ("Deferred income taxes and other
+        liabilities" line maps whole to ONE bucket)
+    total liabilities tie to 22,974 (= printed L&E 37,064 - equity 14,090; the
+        filing prints no explicit "Total liabilities" line) with NO auto-plug.
+Known trap: the standardizer used to lump current portion 999 + long-term 7,030
+into current.debt (8,029), oversize non_current.other_liabilities (3,360), and
+let the auto-plug shave 10 off other_current_liabilities to force the tie —
+"balanced" but the bucket breakdown was wrong.
 """
 
 import json
@@ -45,11 +61,19 @@ import logging
 import os
 import sys
 
-from Balance_sheet.pipeline import run_pipeline
+from Balance_sheet.pipeline import run_markdown_pipeline, run_pipeline
 
 DHC_SAMPLE_PDF = r"test_data\dhc_10q.pdf"
 AAPL_SAMPLE_PDF = r"test_data\aapl_10q.pdf"
 CME_SAMPLE_PDF = r"test_data\cme_10q.pdf"
+NIKE_SAMPLE_MD = r"test_data\nike_10q.md"
+
+# NIKE prints Total assets but no explicit "Total liabilities" line — the
+# code-read tally targets (most-recent column) are supplied here, exactly as
+# pdf_locator.extract_printed_totals would for a PDF sample.
+NIKE_PRINTED_TOTALS = {"total_assets": 37064, "total_liabilities": 22974}
+
+_PLUG_MARKERS = ("Auto-plugged", "Auto-removed", "LIKELY WRONG-BUCKET")
 
 
 def check_dhc(result: dict) -> list[str]:
@@ -154,15 +178,80 @@ def check_cme(result: dict) -> list[str]:
     return failures
 
 
+def check_nike(result: dict) -> list[str]:
+    failures = []
+    tally = result["tally"]
+    totals = result["filing_totals"]
+    current = result["liabilities"]["current"]
+    non_current = result["liabilities"]["non_current"]
+    if totals["total_liabilities"] != 22974:
+        failures.append(f"total_liabilities {totals['total_liabilities']:,} != 22,974")
+    if not tally["assets_balanced"]:
+        failures.append("assets_balanced is False")
+    if not tally["liabilities_balanced"]:
+        failures.append("liabilities_balanced is False")
+    if current["debt"] != 999:
+        failures.append(
+            f"current.debt {current['debt']:,} != 999 (8,029 would mean "
+            f"long-term debt was lumped into current.debt)"
+        )
+    if non_current["long_term_debt"] != 7030:
+        failures.append(
+            f"non_current.long_term_debt {non_current['long_term_debt']:,} != 7,030"
+        )
+    if current["accounts_trade_payable"] != 2888:
+        failures.append(
+            f"accounts_trade_payable {current['accounts_trade_payable']:,} != 2,888"
+        )
+    if current["lease_liabilities"] != 493:
+        failures.append(
+            f"current.lease_liabilities {current['lease_liabilities']:,} != 493"
+        )
+    if current["other_current_liabilities"] != 6458:
+        failures.append(
+            f"other_current_liabilities {current['other_current_liabilities']:,} "
+            f"!= 6,458 (accrued 6,183 + income taxes payable 275)"
+        )
+    if non_current["lease_liabilities"] != 2656:
+        failures.append(
+            f"non_current.lease_liabilities {non_current['lease_liabilities']:,} != 2,656"
+        )
+    if non_current["deferred_rev_and_tax"] != 2450:
+        failures.append(
+            f"non_current.deferred_rev_and_tax {non_current['deferred_rev_and_tax']:,} "
+            f"!= 2,450 (the combined deferred-tax line must map whole to one bucket)"
+        )
+    for bucket in ("preferred_stock", "mezzanine_equity"):
+        if result["liabilities"][bucket] != 0:
+            failures.append(
+                f"{bucket} {result['liabilities'][bucket]:,} != 0 (NIKE's "
+                f"redeemable preferred is nil; Class B common stock 3 is "
+                f"ordinary equity, not mezzanine)"
+            )
+    plugs = [w for w in result.get("warnings", [])
+             if any(m in w for m in _PLUG_MARKERS)]
+    if plugs:
+        failures.append(f"auto-plug fired (must tie by correct mapping): {plugs}")
+    return failures
+
+
 SAMPLES = [
     (DHC_SAMPLE_PDF, "dhc", check_dhc),
     (AAPL_SAMPLE_PDF, "aapl", check_aapl),
     (CME_SAMPLE_PDF, "cme", check_cme),
+    (NIKE_SAMPLE_MD, "nike", check_nike),
 ]
 
 
 def _run_one(pdf_path: str) -> list[str]:
-    result = run_pipeline(pdf_path)
+    if pdf_path.lower().endswith(".md"):
+        # Markdown fixture — Stages 3-4 only (no PDF locate/parse).
+        with open(pdf_path, encoding="utf-8") as fh:
+            markdown = fh.read()
+        printed = NIKE_PRINTED_TOTALS if "nike" in pdf_path.lower() else None
+        result = run_markdown_pipeline(markdown, printed_totals=printed)
+    else:
+        result = run_pipeline(pdf_path)
     print(json.dumps(result, indent=2))
 
     tally = result.get("tally", {})
@@ -200,8 +289,9 @@ def main() -> int:
     else:
         paths = [p for p, _tag, _c in SAMPLES if os.path.isfile(p)]
         if not paths:
-            print("No sample PDFs found (expected "
-                  f"{DHC_SAMPLE_PDF}, {AAPL_SAMPLE_PDF} and/or {CME_SAMPLE_PDF}).")
+            print("No samples found (expected "
+                  f"{DHC_SAMPLE_PDF}, {AAPL_SAMPLE_PDF}, {CME_SAMPLE_PDF} "
+                  f"and/or {NIKE_SAMPLE_MD}).")
             return 1
 
     all_failures = []

@@ -1,10 +1,10 @@
 """Stage 1 — locate the balance-sheet page(s) in a 10-Q/10-K PDF with PyMuPDF.
 
-Finds the page whose text contains a balance-sheet title variant, captures it
-plus the following page (balance sheets often span two pages), confirms both
-"Total assets" and a total-equity/liabilities line are covered (extending by
-one page if not), and exports the captured pages to a small temporary PDF for
-LlamaParse.
+Finds the page whose text contains a balance-sheet title variant. If that page
+alone holds both "Total assets" and a total-equity/liabilities line it is
+captured by itself; otherwise the following page(s) are added until both are
+covered (balance sheets often span two pages). The captured pages are exported
+to a small temporary PDF for LlamaParse.
 """
 
 import logging
@@ -58,9 +58,16 @@ def locate_balance_sheet(pdf_path: str) -> dict:
             if not matched:
                 continue
 
-            # Capture the matched page + the next page (2-page statements).
-            indices = [i] + ([i + 1] if i + 1 < n_pages else [])
-            captured = "\n".join(_page_text(doc, j) for j in indices)
+            # Capture the matched page alone when it already holds the whole
+            # statement (both totals) — a needless next page is a different
+            # statement (e.g. cash flows) that only feeds the LLM noise.
+            # Otherwise add the next page (2-page statements).
+            indices = [i]
+            captured = text
+            if (_TOTAL_ASSETS_MARKER not in captured
+                    or not _has_equity_total(captured)) and i + 1 < n_pages:
+                indices.append(i + 1)
+                captured = "\n".join(_page_text(doc, j) for j in indices)
 
             if _TOTAL_ASSETS_MARKER not in captured:
                 # Title without "Total assets" nearby — likely a table of
@@ -103,8 +110,9 @@ def locate_balance_sheet(pdf_path: str) -> dict:
 def extract_printed_totals(captured_text: str) -> dict:
     """Read the filing's PRINTED totals straight from the page text (most
     recent = first number after the label), so the reconciliation reference
-    never depends on LLM transcription. Returns None per key when the label
-    isn't found — e.g. filings with no explicit "Total liabilities" line."""
+    never depends on LLM transcription. When there is no explicit "Total
+    liabilities" line, it is derived from printed Total liabilities & equity
+    minus printed total equity. Returns None per key when not found."""
     def first_number_after(label_re: str):
         m = re.search(label_re + r"[^\d(]{0,40}\(?\$?\s*([\d,]{4,})", captured_text,
                       re.IGNORECASE)
@@ -112,12 +120,33 @@ def extract_printed_totals(captured_text: str) -> dict:
             return None
         return int(m.group(1).replace(",", ""))
 
-    return {
+    totals = {
         # "total assets" not followed by more words on the label side
         "total_assets": first_number_after(r"total assets"),
         # exclude "Total liabilities and ..." / "Total liabilities, redeemable ..."
         "total_liabilities": first_number_after(r"total liabilities(?!\s*(?:and|&|,))"),
     }
+    if totals["total_liabilities"] is None:
+        # No explicit "Total liabilities" line (e.g. NIKE) — derive it in CODE
+        # from two lines that ARE printed: Total liabilities & equity minus
+        # total equity. Without this the LLM's self-computed total becomes the
+        # tally target, which lets a mis-map/hallucination grade itself.
+        liab_and_equity = first_number_after(
+            r"total liabilities\s*(?:and|&|,)[^\n]{0,60}?equity"
+        )
+        equity = first_number_after(
+            r"total\s+(?:shareholders|stockholders)\W{0,2}\s*equity"
+        )
+        if equity is None:
+            equity = first_number_after(r"total\s+equity")
+        if liab_and_equity is not None and equity is not None and 0 < equity < liab_and_equity:
+            totals["total_liabilities"] = liab_and_equity - equity
+            logger.info(
+                "No printed Total Liabilities line - derived %s = %s (Total "
+                "liabilities & equity) - %s (total equity).",
+                totals["total_liabilities"], liab_and_equity, equity,
+            )
+    return totals
 
 
 def _export_pages(doc: "fitz.Document", indices: list[int]) -> str:

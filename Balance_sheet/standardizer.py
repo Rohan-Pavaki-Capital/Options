@@ -37,16 +37,34 @@ RULES:
   filing is unclassified (common for REITs/banks), use judgement: cash, receivables,
   inventory, short-term items -> current; property, long-term investments, intangibles ->
   non-current.
-- DEBT: combine ALL interest-bearing debt tranches (e.g. senior secured notes, senior
-  unsecured notes, secured debt & finance leases, term debt, commercial paper, revolving
-  credit, long-term debt) into 'debt' — the schema's single debt bucket (under current).
-  Put ALL interest-bearing debt there whether the filing shows it as current or long-term.
-  Do NOT bury long-term debt in other_liabilities.
-- ACCRUED INTEREST, deferred items, and any miscellaneous payables must be mapped (usually
-  other_liabilities / deferred_rev_and_tax) — never omitted, or liabilities will under-count.
+- DEBT SPLIT: map interest-bearing debt by the filing's current/non-current classification.
+  - Current portion of long-term debt, notes payable, short-term borrowings, commercial paper,
+    current debt -> current.debt.
+  - Long-term debt / non-current borrowings -> non_current.long_term_debt.
+  Never lump long-term debt into current.debt, and never bury debt in other_liabilities.
+  (If the filing is unclassified, use judgement: revolvers/commercial paper/current maturities
+  -> current.debt; term debt, notes and bonds -> non_current.long_term_debt.)
+- Deferred income tax liabilities -> deferred_rev_and_tax (current or non-current per the filing).
+  When a filing combines "Deferred income taxes and other liabilities" on one line, map the whole
+  line to the non-current bucket that matches its dominant nature (deferred_rev_and_tax if it is
+  primarily deferred tax; otherwise other_liabilities) - but map it to exactly ONE bucket, do not
+  split unless the filing itself splits it. Do not double-count accrued liabilities and income
+  taxes payable - each line goes to exactly one current bucket (accrued -> other_current_liabilities,
+  income taxes payable -> other_current_liabilities or deferred_rev_and_tax per filing).
+- ACCRUED INTEREST and any miscellaneous payables must be mapped (usually other_liabilities /
+  other_current_liabilities) — never omitted, or liabilities will under-count.
 - Equity is NOT part of the buckets. Do not map equity lines into liability buckets.
   (preferred_stock and mezzanine_equity are the only equity-adjacent buckets — fill them only
   if the filing explicitly shows preferred stock or mezzanine/temporary equity.)
+  Common stock at stated/par value, capital in excess of stated/par value, additional paid-in
+  capital, retained earnings, treasury stock and accumulated other comprehensive income are
+  ordinary EQUITY — NEVER map them into preferred_stock or mezzanine_equity (or any bucket).
+  mezzanine_equity is ONLY for temporary equity shown outside permanent equity (e.g. redeemable
+  preferred stock, redeemable noncontrolling interests); if that line prints a dash/zero, leave
+  the bucket 0.
+- NEVER invent a number. Every bucket value must be a printed line value (or a ' + ' chain of
+  printed line values) from the most-recent column. If the buckets do not sum to the printed
+  total, the fix is ALWAYS re-mapping printed lines — never inserting a balancing figure.
 - filing_totals.total_assets = the filing's PRINTED "Total assets" (most recent column).
   filing_totals.total_liabilities = the filing's PRINTED "Total liabilities" line. If no
   explicit "Total liabilities" line exists, compute it as printed Total liabilities & equity
@@ -110,10 +128,10 @@ tie):
    listed under Current Assets -> other_current_assets; the matching one under Current
    Liabilities -> other_current_liabilities. (Both sides must be mapped — see offsetting rule.)
 
-6. DEBT: all interest-bearing borrowings -> debt. The schema has a single debt bucket under
-   current — put ALL interest-bearing debt there, whether the filing shows it as current
-   (short-term/current portion) or long-term ("Long-term debt"). Do NOT bury long-term debt in
-   other_liabilities.
+6. DEBT SPLIT: map interest-bearing debt by the filing's current/non-current classification —
+   current portion of long-term debt, notes payable, short-term borrowings, commercial paper
+   -> current.debt ; long-term debt / non-current borrowings -> non_current.long_term_debt.
+   Never lump long-term debt into current.debt, and never bury debt in other_liabilities.
 
 7. other_* buckets are a LAST RESORT for lines with no specific bucket — not a dumping ground.
    Only use them for genuinely miscellaneous items (and intangibles/goodwill per rule 4, and
@@ -157,6 +175,9 @@ Return the JSON now.
 
 _CELL_NUM_RE = re.compile(r"-?\d{1,3}(?:,\d{3})*(?:\.\d+)?")
 
+# Placeholder a filing prints for a zero/nil value in a column.
+_DASH_CELLS = {"—", "–", "-", "--"}
+
 
 def extract_line_items(markdown: str) -> list[tuple[str, float]]:
     """Pull (label, most-recent-column value) pairs from the markdown table
@@ -177,6 +198,12 @@ def extract_line_items(markdown: str) -> list[tuple[str, float]]:
             continue  # header/subtotal/total rows never map into buckets
         for cell in cells[1:]:
             raw = cell.strip("* ").replace("$", "").strip()
+            if raw in _DASH_CELLS:
+                # Most-recent column prints a dash = zero. Stop here — falling
+                # through would read the PRIOR-period column (e.g. NIKE
+                # "Notes payable | — | 5" must be 0, not 5).
+                items.append((label, 0))
+                break
             negative = raw.startswith("(") and raw.endswith(")")
             raw = raw.strip("()").strip()
             m = _CELL_NUM_RE.fullmatch(raw)
@@ -185,7 +212,7 @@ def extract_line_items(markdown: str) -> list[tuple[str, float]]:
                 if negative:
                     value = -value
                 items.append((label, int(value) if value == int(value) else value))
-                break  # first numeric cell = most-recent column
+                break  # first numeric/dash cell = most-recent column
     return items
 
 
@@ -225,9 +252,11 @@ def _build_user_message(markdown: str) -> str:
         "tax assets -> non_current.other_assets.\n"
         "- Right-of-use assets -> lease_assets (non_current unless the "
         "filing shows a current portion).\n"
-        "- ALL interest-bearing debt, including long-term debt -> "
-        "current.debt (the schema's only debt bucket; never "
-        "other_liabilities).\n"
+        "- Interest-bearing debt splits by the filing's classification: "
+        "current portion of long-term debt / notes payable / short-term "
+        "borrowings -> current.debt ; long-term debt / non-current "
+        "borrowings -> non_current.long_term_debt (never other_liabilities, "
+        "never lumped into current.debt).\n"
         "- Real estate blocks (Land / Buildings and improvements / less "
         "Accumulated depreciation) belong TOGETHER in exactly ONE bucket: "
         "real_estate_assets for REITs/property companies (include the "

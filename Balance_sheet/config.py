@@ -42,6 +42,11 @@ TALLY_TOLERANCE = 1
 # (env-overridable; after these, the deterministic other_* plug reconciles).
 TALLY_MAX_RETRIES = int(os.getenv("BALANCE_SHEET_TALLY_RETRIES", "2"))
 
+# Stage 4 — a plug at or below this size is NOT rounding noise: a correct
+# mapping ties exactly, so a small residual gap means a line landed in the
+# wrong bucket. The plug still applies, but with a loud wrong-bucket warning.
+PLUG_SUSPICIOUS_GAP = int(os.getenv("BALANCE_SHEET_PLUG_SUSPICIOUS_GAP", "50"))
+
 # ---------------------------------------------------------------------------
 # Fixed target schema (Damodaran-style buckets). These keys are FIXED —
 # every balance-sheet line maps into exactly one; no new keys may be invented.
@@ -60,7 +65,8 @@ ASSET_CURRENT_KEYS = [
 ]
 
 LIABILITY_NON_CURRENT_KEYS = [
-    "pension", "lease_liabilities", "deferred_rev_and_tax", "other_liabilities",
+    "pension", "lease_liabilities", "deferred_rev_and_tax", "long_term_debt",
+    "other_liabilities",
 ]
 
 LIABILITY_CURRENT_KEYS = [

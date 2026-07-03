@@ -34,6 +34,79 @@ def _merge_balanced_sides(first: dict, retry: dict) -> dict:
     return merged
 
 
+def run_markdown_pipeline(markdown: str, source_pages: list | None = None,
+                          printed_totals: dict | None = None) -> dict:
+    """Stages 3-4 on balance-sheet markdown that is already in hand:
+    LLM standardization, then the code tally with the LLM correction loop and
+    the last-resort deterministic plug. `printed_totals` are the code-read
+    printed totals (None values are ignored — the LLM's value is kept)."""
+    source_pages = source_pages or []
+    printed_totals = printed_totals or {}
+
+    def _apply_printed_totals(res: dict) -> None:
+        for key, value in printed_totals.items():
+            if value is not None and res["filing_totals"].get(key) != value:
+                logger.info(
+                    "Overriding LLM %s=%s with printed value %s",
+                    key, res["filing_totals"].get(key), value,
+                )
+                res["filing_totals"][key] = value
+
+    # Stage 3 — LLM standardization into the fixed schema
+    try:
+        result = standardizer.standardize(markdown)
+    except Exception as exc:
+        logger.exception("Stage 3 (standardize) failed")
+        result = empty_result()
+        result["source_pages"] = source_pages
+        result["warnings"].append(f"Stage 3 (standardize) failed: {exc}")
+        result["error"] = str(exc)
+        return result
+    # Code (not the LLM) is the source of truth for the pages used.
+    result["source_pages"] = source_pages
+    result.setdefault("warnings", [])
+
+    # Stage 4 — tally check in code, with an LLM correction loop on
+    # imbalance: re-prompt with the exact gap, re-tally, repeat until both
+    # sides balance or TALLY_MAX_RETRIES is reached.
+    tally.coerce_result_numbers(result)
+    _apply_printed_totals(result)
+    tally.run_tally(result)
+
+    for attempt in range(1, TALLY_MAX_RETRIES + 1):
+        if tally.is_balanced(result):
+            break
+        gap_message = tally.build_gap_message(result)
+        logger.info(
+            "Tally failed — correction re-prompt %d/%d: %s",
+            attempt, TALLY_MAX_RETRIES, gap_message,
+        )
+        try:
+            retry = standardizer.restandardize(markdown, result, gap_message)
+            retry["source_pages"] = source_pages
+            tally.coerce_result_numbers(retry)
+            _apply_printed_totals(retry)
+            tally.run_tally(retry)
+            result = _merge_balanced_sides(result, retry)
+        except Exception as exc:
+            logger.exception("Tally re-prompt failed; keeping best result")
+            result["warnings"].append(f"Tally re-prompt failed: {exc}")
+            break
+
+    if not tally.is_balanced(result):
+        # Name the exact remaining gap, then deterministically plug it into
+        # an other_* bucket so the buckets always sum to the printed totals
+        # (the warnings keep the plug visible for review).
+        tally.add_unbalanced_warnings(result)
+        tally.apply_deterministic_plug(result)
+    line_items = standardizer.extract_line_items(markdown)
+    if len(line_items) >= 5:  # same reliability bar as the prompt checklist
+        tally.guard_equity_adjacent_buckets(result, line_items)
+    tally.sanity_check_other_buckets(result)
+
+    return result
+
+
 def run_pipeline(pdf_path: str) -> dict:
     """Run the full 4-stage pipeline on a 10-Q/10-K PDF path."""
     result = empty_result()
@@ -49,7 +122,8 @@ def run_pipeline(pdf_path: str) -> dict:
             return result
         temp_pdf = located["temp_pdf_path"]
         source_pages = located["page_numbers"]
-        result["warnings"].extend(located.get("warnings", []))
+        stage1_warnings = located.get("warnings", [])
+        result["warnings"].extend(stage1_warnings)
         logger.info("Captured pages %s from %s", source_pages, pdf_path)
 
         # Printed totals read from the page text in CODE — the reconciliation
@@ -58,15 +132,6 @@ def run_pipeline(pdf_path: str) -> dict:
         printed_totals = pdf_locator.extract_printed_totals(
             located.get("captured_text", "")
         )
-
-        def _apply_printed_totals(res: dict) -> None:
-            for key, value in printed_totals.items():
-                if value is not None and res["filing_totals"].get(key) != value:
-                    logger.info(
-                        "Overriding LLM %s=%s with printed value %s",
-                        key, res["filing_totals"].get(key), value,
-                    )
-                    res["filing_totals"][key] = value
 
         # Stage 2 — LlamaParse to markdown
         try:
@@ -79,55 +144,9 @@ def run_pipeline(pdf_path: str) -> dict:
             return result
         logger.info("Markdown length: %d chars", len(markdown))
 
-        # Stage 3 — LLM standardization into the fixed schema
-        try:
-            result = standardizer.standardize(markdown)
-        except Exception as exc:
-            logger.exception("Stage 3 (standardize) failed")
-            result = empty_result()
-            result["source_pages"] = source_pages
-            result["warnings"].append(f"Stage 3 (standardize) failed: {exc}")
-            result["error"] = str(exc)
-            return result
-        # Code (not the LLM) is the source of truth for the pages used.
-        result["source_pages"] = source_pages
-        result.setdefault("warnings", [])
-
-        # Stage 4 — tally check in code, with an LLM correction loop on
-        # imbalance: re-prompt with the exact gap, re-tally, repeat until both
-        # sides balance or TALLY_MAX_RETRIES is reached.
-        tally.coerce_result_numbers(result)
-        _apply_printed_totals(result)
-        tally.run_tally(result)
-
-        for attempt in range(1, TALLY_MAX_RETRIES + 1):
-            if tally.is_balanced(result):
-                break
-            gap_message = tally.build_gap_message(result)
-            logger.info(
-                "Tally failed — correction re-prompt %d/%d: %s",
-                attempt, TALLY_MAX_RETRIES, gap_message,
-            )
-            try:
-                retry = standardizer.restandardize(markdown, result, gap_message)
-                retry["source_pages"] = source_pages
-                tally.coerce_result_numbers(retry)
-                _apply_printed_totals(retry)
-                tally.run_tally(retry)
-                result = _merge_balanced_sides(result, retry)
-            except Exception as exc:
-                logger.exception("Tally re-prompt failed; keeping best result")
-                result["warnings"].append(f"Tally re-prompt failed: {exc}")
-                break
-
-        if not tally.is_balanced(result):
-            # Name the exact remaining gap, then deterministically plug it into
-            # an other_* bucket so the buckets always sum to the printed totals
-            # (the warnings keep the plug visible for review).
-            tally.add_unbalanced_warnings(result)
-            tally.apply_deterministic_plug(result)
-        tally.sanity_check_other_buckets(result)
-
+        # Stages 3-4 — standardize + tally
+        result = run_markdown_pipeline(markdown, source_pages, printed_totals)
+        result["warnings"] = stage1_warnings + result["warnings"]
         return result
     finally:
         if temp_pdf and os.path.exists(temp_pdf):
