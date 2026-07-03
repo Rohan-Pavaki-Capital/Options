@@ -42,7 +42,9 @@ property (355.4) into real_estate_assets — tally passed but placement was wron
 NIKE 10-Q, February 28 2026 (dollars in millions) — debt-split regression
 (markdown fixture, Stages 3-4 only; balance sheet transcribed from the filing):
     current.debt == 999 (current portion of LT debt; notes payable 0)
-    non_current.long_term_debt == 7,030
+    non_current.other_liabilities == 7,030 (long-term debt; the schema mirrors
+        the Excel template, which has NO non-current debt row — user decision
+        2026-07-04: long-term debt lives in other_liabilities)
     accounts_trade_payable == 2,888 ; current.lease_liabilities == 493
     other_current_liabilities == 6,458 (accrued 6,183 + income taxes payable 275)
     non_current.lease_liabilities == 2,656
@@ -195,9 +197,10 @@ def check_nike(result: dict) -> list[str]:
             f"current.debt {current['debt']:,} != 999 (8,029 would mean "
             f"long-term debt was lumped into current.debt)"
         )
-    if non_current["long_term_debt"] != 7030:
+    if non_current["other_liabilities"] != 7030:
         failures.append(
-            f"non_current.long_term_debt {non_current['long_term_debt']:,} != 7,030"
+            f"non_current.other_liabilities {non_current['other_liabilities']:,} "
+            f"!= 7,030 (long-term debt belongs there; no non-current debt row)"
         )
     if current["accounts_trade_payable"] != 2888:
         failures.append(

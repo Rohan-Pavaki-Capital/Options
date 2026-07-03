@@ -164,9 +164,9 @@ The user message the LLM receives contains, in order:
    tax assets → `other_assets`; right-of-use assets → `lease_assets`; debt
    splits by the filing's classification — current portion of long-term debt /
    notes payable / short-term borrowings → `current.debt`, long-term debt /
-   non-current borrowings → `non_current.long_term_debt` (never
-   `other_liabilities`, never lumped into `current.debt`);
-   Land/Buildings/accumulated-depreciation blocks stay
+   non-current borrowings → `non_current.other_liabilities` (the schema mirrors
+   the Excel template, which has no non-current debt row; never lumped into
+   `current.debt`); Land/Buildings/accumulated-depreciation blocks stay
    **together in exactly one bucket** (`real_estate_assets` for REITs including
    the negative depreciation, `ppe` otherwise); subtotal/total rows are never
    mapped.
@@ -177,7 +177,7 @@ only; numbers exactly as printed (strip only `$` and `,`); every line into
 exactly one bucket, leftovers into the closest `other_*`; current vs non-current
 by the filing's own sub-headers (judgement for unclassified REIT/bank sheets);
 interest-bearing debt split by the filing's current/non-current classification
-(`current.debt` vs `non_current.long_term_debt`); equity never mapped
+(`current.debt` vs `non_current.other_liabilities`); equity never mapped
 into liability buckets; and the **SINGLE-BUCKET RULE** — every source line
 contributes to exactly one bucket, `other_*` holds only lines not captured by a
 specific bucket, never a subtotal and its components, self-verify sums before
@@ -250,7 +250,7 @@ Every balance-sheet line maps into exactly one of these buckets (keys are FIXED)
 |---|---|
 | Assets — non-current | `lease_assets`, `real_estate_assets`, `investment_assets`, `investment_in_other`, `assets_held_for_sale`, `asset_from_discontinued_business`, `pension_assets`, `other_assets`, `ppe` |
 | Assets — current | `lease_assets`, `inventory`, `accounts_trade_receivable`, `tax`, `other_current_assets` |
-| Liabilities — non-current | `pension`, `lease_liabilities`, `deferred_rev_and_tax`, `long_term_debt`, `other_liabilities` |
+| Liabilities — non-current | `pension`, `lease_liabilities`, `deferred_rev_and_tax`, `other_liabilities` |
 | Liabilities — current | `debt`, `lease_liabilities`, `accounts_trade_payable`, `deferred_rev_and_tax`, `other_current_liabilities` |
 | Equity-adjacent | `preferred_stock`, `mezzanine_equity` (filled only if explicitly shown; excluded from the liabilities tally) |
 

@@ -40,10 +40,11 @@ RULES:
 - DEBT SPLIT: map interest-bearing debt by the filing's current/non-current classification.
   - Current portion of long-term debt, notes payable, short-term borrowings, commercial paper,
     current debt -> current.debt.
-  - Long-term debt / non-current borrowings -> non_current.long_term_debt.
-  Never lump long-term debt into current.debt, and never bury debt in other_liabilities.
+  - Long-term debt / non-current borrowings -> non_current.other_liabilities (the schema has no
+    non-current debt bucket - group long-term debt there).
+  Never lump long-term debt into current.debt.
   (If the filing is unclassified, use judgement: revolvers/commercial paper/current maturities
-  -> current.debt; term debt, notes and bonds -> non_current.long_term_debt.)
+  -> current.debt; term debt, notes and bonds -> non_current.other_liabilities.)
 - Deferred income tax liabilities -> deferred_rev_and_tax (current or non-current per the filing).
   When a filing combines "Deferred income taxes and other liabilities" on one line, map the whole
   line to the non-current bucket that matches its dominant nature (deferred_rev_and_tax if it is
@@ -130,8 +131,8 @@ tie):
 
 6. DEBT SPLIT: map interest-bearing debt by the filing's current/non-current classification —
    current portion of long-term debt, notes payable, short-term borrowings, commercial paper
-   -> current.debt ; long-term debt / non-current borrowings -> non_current.long_term_debt.
-   Never lump long-term debt into current.debt, and never bury debt in other_liabilities.
+   -> current.debt ; long-term debt / non-current borrowings -> non_current.other_liabilities
+   (no non-current debt bucket exists). Never lump long-term debt into current.debt.
 
 7. other_* buckets are a LAST RESORT for lines with no specific bucket — not a dumping ground.
    Only use them for genuinely miscellaneous items (and intangibles/goodwill per rule 4, and
@@ -255,8 +256,8 @@ def _build_user_message(markdown: str) -> str:
         "- Interest-bearing debt splits by the filing's classification: "
         "current portion of long-term debt / notes payable / short-term "
         "borrowings -> current.debt ; long-term debt / non-current "
-        "borrowings -> non_current.long_term_debt (never other_liabilities, "
-        "never lumped into current.debt).\n"
+        "borrowings -> non_current.other_liabilities (never lumped into "
+        "current.debt).\n"
         "- Real estate blocks (Land / Buildings and improvements / less "
         "Accumulated depreciation) belong TOGETHER in exactly ONE bucket: "
         "real_estate_assets for REITs/property companies (include the "

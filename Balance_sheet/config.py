@@ -64,9 +64,11 @@ ASSET_CURRENT_KEYS = [
     "tax", "other_current_assets",
 ]
 
+# NOTE: the keys mirror the Excel template's rows EXACTLY — no extra fields.
+# There is deliberately no non-current debt bucket: long-term debt goes into
+# non_current.other_liabilities (user decision 2026-07-04, Excel template fixed).
 LIABILITY_NON_CURRENT_KEYS = [
-    "pension", "lease_liabilities", "deferred_rev_and_tax", "long_term_debt",
-    "other_liabilities",
+    "pension", "lease_liabilities", "deferred_rev_and_tax", "other_liabilities",
 ]
 
 LIABILITY_CURRENT_KEYS = [
