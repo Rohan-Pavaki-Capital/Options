@@ -9,7 +9,7 @@ import logging
 import os
 
 from . import parser, pdf_locator, standardizer, tally
-from .config import empty_result
+from .config import TALLY_MAX_RETRIES, empty_result
 
 logger = logging.getLogger("balance_sheet.pipeline")
 
@@ -93,14 +93,21 @@ def run_pipeline(pdf_path: str) -> dict:
         result["source_pages"] = source_pages
         result.setdefault("warnings", [])
 
-        # Stage 4 — tally check in code, with one LLM re-prompt on imbalance
+        # Stage 4 — tally check in code, with an LLM correction loop on
+        # imbalance: re-prompt with the exact gap, re-tally, repeat until both
+        # sides balance or TALLY_MAX_RETRIES is reached.
         tally.coerce_result_numbers(result)
         _apply_printed_totals(result)
         tally.run_tally(result)
 
-        if not tally.is_balanced(result):
+        for attempt in range(1, TALLY_MAX_RETRIES + 1):
+            if tally.is_balanced(result):
+                break
             gap_message = tally.build_gap_message(result)
-            logger.info("Tally failed — re-prompting LLM once: %s", gap_message)
+            logger.info(
+                "Tally failed — correction re-prompt %d/%d: %s",
+                attempt, TALLY_MAX_RETRIES, gap_message,
+            )
             try:
                 retry = standardizer.restandardize(markdown, result, gap_message)
                 retry["source_pages"] = source_pages
@@ -109,11 +116,16 @@ def run_pipeline(pdf_path: str) -> dict:
                 tally.run_tally(retry)
                 result = _merge_balanced_sides(result, retry)
             except Exception as exc:
-                logger.exception("Tally re-prompt failed; keeping first result")
+                logger.exception("Tally re-prompt failed; keeping best result")
                 result["warnings"].append(f"Tally re-prompt failed: {exc}")
+                break
 
         if not tally.is_balanced(result):
+            # Name the exact remaining gap, then deterministically plug it into
+            # an other_* bucket so the buckets always sum to the printed totals
+            # (the warnings keep the plug visible for review).
             tally.add_unbalanced_warnings(result)
+            tally.apply_deterministic_plug(result)
         tally.sanity_check_other_buckets(result)
 
         return result

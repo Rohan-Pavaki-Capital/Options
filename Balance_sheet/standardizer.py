@@ -68,6 +68,23 @@ SINGLE-BUCKET RULE (critical):
   sum of ALL liability buckets must equal printed Total Liabilities. If they do not, you have
   either double-counted (same line in two buckets) or missed a line — fix it before returning.
 
+OFFSETTING / CUSTODIAL BALANCES (critical for banks, brokers, exchanges, clearing houses):
+Performance-bond, guaranty-fund, margin deposits, segregated customer funds, and other
+custodial balances appear on BOTH sides of the balance sheet in near-equal amounts — the
+entity holds cash/securities as an ASSET and owes them back as a LIABILITY. If you map such a
+balance as a liability (e.g. into other_current_liabilities), you MUST also map its
+corresponding asset (the cash and securities held as that collateral) into an asset bucket
+(other_current_assets or other_assets). NEVER map one side without the other.
+After mapping, the sum of all asset buckets MUST equal printed Total Assets and the sum of all
+liability buckets MUST equal printed Total Liabilities. If assets fall short by roughly the
+size of a large custodial liability you mapped, you omitted the matching custodial asset — add
+it.
+
+If you are given a CORRECTION note describing an over- or under-count, fix ONLY the indicated
+issue: move the offending amount out of / into the correct other_* bucket so every line is
+counted exactly once and the bucket sums equal the printed Total Assets and Total Liabilities.
+Return the full corrected JSON, same schema, numbers as printed.
+
 Return the JSON now.
 """
 
@@ -281,8 +298,9 @@ def standardize(markdown: str) -> dict:
 
 
 def restandardize(markdown: str, previous_json: dict, gap_message: str) -> dict:
-    """Tally-failure hook (Stage 4): re-call the LLM ONCE with the previous
-    JSON and the exact gap so it can re-map missing lines."""
+    """Tally-failure hook (Stage 4): re-call the LLM with the previous JSON
+    and the exact gap so it can re-map missing/double-counted lines. Called
+    in a loop by the pipeline until balanced or max retries."""
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": _build_user_message(markdown)},
@@ -290,7 +308,7 @@ def restandardize(markdown: str, previous_json: dict, gap_message: str) -> dict:
         {
             "role": "user",
             "content": (
-                f"{gap_message} Correct the previous JSON with the SMALLEST "
+                f"CORRECTION note: {gap_message} Correct the previous JSON with the SMALLEST "
                 "possible edit: change ONLY the bucket(s) implicated by the "
                 "gap(s) above and copy every other bucket value UNCHANGED "
                 "from the previous JSON. When a bucket holds several lines, "

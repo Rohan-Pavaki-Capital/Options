@@ -38,6 +38,10 @@ TITLE_VARIANTS = [
 # Stage 4 — allowed rounding difference between summed buckets and printed totals.
 TALLY_TOLERANCE = 1
 
+# Stage 4 — max LLM correction re-prompts when a side does not tally
+# (env-overridable; after these, the deterministic other_* plug reconciles).
+TALLY_MAX_RETRIES = int(os.getenv("BALANCE_SHEET_TALLY_RETRIES", "2"))
+
 # ---------------------------------------------------------------------------
 # Fixed target schema (Damodaran-style buckets). These keys are FIXED —
 # every balance-sheet line maps into exactly one; no new keys may be invented.

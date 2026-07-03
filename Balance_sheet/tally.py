@@ -162,10 +162,24 @@ def is_balanced(result: dict) -> bool:
     return result["tally"]["assets_balanced"] and result["tally"]["liabilities_balanced"]
 
 
+def _closest_bucket_to_gap(result: dict, side: str, gap: float):
+    """Find the bucket on this side whose value is closest to the gap
+    (any bucket, no distance cutoff — used for the over-count message)."""
+    best = None
+    for _sub, key, value in _side_buckets(result, side):
+        if not value:
+            continue
+        distance = abs(value - gap)
+        if best is None or distance < best[0]:
+            best = (distance, key, value)
+    return best[1] if best else None
+
+
 def build_gap_message(result: dict) -> str:
-    """Targeted correction message for the one-shot LLM re-prompt (Stage 4
-    hook), built from the diagnosis: names the suspected double-counted
-    bucket for over-counts, the missing amount for under-counts."""
+    """Targeted CORRECTION message for the LLM re-prompt loop (Stage 4),
+    built from the diagnosis: names the suspected double-counted bucket for
+    over-counts; for under-counts, points at the missing line — very often
+    the custodial/collateral asset matching a large mapped liability."""
     tally = result["tally"]
     totals = result["filing_totals"]
     parts = []
@@ -173,40 +187,46 @@ def build_gap_message(result: dict) -> str:
         side = diag["side"]
         label = "Assets" if side == "assets" else "Liabilities"
         printed_label = "Total Assets" if side == "assets" else "Total Liabilities"
+        other_hint = (
+            "other_assets (or other_current_assets)" if side == "assets"
+            else "other_liabilities (or other_current_liabilities)"
+        )
         sum_v = tally[f"sum_{side}"]
         printed = totals[f"total_{side}"]
         gap = diag["gap"]
         if diag["type"] == "double_count":
-            bucket = diag["likely_double_counted_bucket"]
-            if bucket:
-                value = diag["bucket_value"]
+            closest = (diag["likely_double_counted_bucket"]
+                       or _closest_bucket_to_gap(result, side, gap))
+            if closest:
                 parts.append(
-                    f"{label} summed to {sum_v:,} but printed {printed_label} is "
-                    f"{printed:,} (over by {gap:,}). This ~= {bucket} ({value:,}), "
-                    f"so that amount appears in TWO buckets: '{bucket}' and one "
-                    f"other bucket holding the same line(s) — often an other_* "
-                    f"bucket, or ppe vs real_estate_assets both holding the same "
-                    f"property block. Re-map so those line(s) are in exactly ONE "
-                    f"appropriate bucket and removed from the other."
+                    f"{label} over by {gap:,} (buckets sum to {sum_v:,} vs printed "
+                    f"{printed_label} {printed:,}). The value {gap:,} ~= bucket "
+                    f"'{closest}'. A line is counted in both '{closest}' and an "
+                    f"other_* bucket — remove it from other_* so each line is "
+                    f"counted once. Return corrected JSON."
                 )
             else:
                 parts.append(
-                    f"{label} summed to {sum_v:,} but printed {printed_label} is "
-                    f"{printed:,} (over by {gap:,}). A line was double-counted "
-                    f"(same line in two buckets) or a subtotal row was mapped - "
-                    f"re-map so each individual line is in exactly ONE bucket and "
-                    f"no subtotal rows are mapped."
+                    f"{label} over by {gap:,} (buckets sum to {sum_v:,} vs printed "
+                    f"{printed_label} {printed:,}). A line is counted in two "
+                    f"buckets or a subtotal row was mapped — re-map so each line "
+                    f"is counted exactly once. Return corrected JSON."
                 )
         else:
             parts.append(
-                f"{label} summed to {sum_v:,} but printed {printed_label} is "
-                f"{printed:,} (under by {abs(gap):,}); a line was not mapped - "
-                f"add the missing line(s) to the appropriate other_* bucket."
+                f"{label} under by {abs(gap):,} (buckets sum to {sum_v:,} vs "
+                f"printed {printed_label} {printed:,}). A line summing to about "
+                f"{abs(gap):,} was not mapped. This is very often the custodial / "
+                f"performance-bond / collateral {'ASSET' if side == 'assets' else 'balance'} "
+                f"that matches a large amount you already mapped on the other "
+                f"side (e.g. other_current_liabilities). Add {abs(gap):,} to "
+                f"{other_hint} so {side} tie to printed {printed_label}. "
+                f"Return corrected JSON."
             )
     if not parts:  # defensive: called without a diagnosis
         parts.append(
             "The bucket sums do not match the printed totals - re-map so every "
-            "line is included in exactly one bucket."
+            "line is included in exactly one bucket. Return corrected JSON."
         )
     return " ".join(parts)
 
@@ -242,6 +262,43 @@ def add_unbalanced_warnings(result: dict) -> dict:
             )
         result["warnings"].append(text)
     return result
+
+
+def apply_deterministic_plug(result: dict) -> dict:
+    """Last-resort reconcile AFTER the LLM retries: force each side's buckets
+    to sum to the printed total by adjusting ONLY an other_* bucket (never a
+    specific bucket), with a warning making the plug visible for review.
+    Guarantees the bucket sums always tie to the printed totals."""
+    for side, printed_label in (("assets", "Total Assets"),
+                                ("liabilities", "Total Liabilities")):
+        gap = result["tally"][f"sum_{side}"] - result["filing_totals"][f"total_{side}"]
+        if abs(gap) <= TALLY_TOLERANCE:
+            continue
+        other_key = "other_assets" if side == "assets" else "other_liabilities"
+        if gap < 0:
+            # Buckets fall short — add the shortfall to the non-current other_* bucket.
+            shortfall = -gap
+            shortfall = int(shortfall) if shortfall == int(shortfall) else shortfall
+            result[side]["non_current"][other_key] += shortfall
+            result["warnings"].append(
+                f"Auto-plugged {shortfall:,} into {other_key} to reconcile to "
+                f"printed {printed_label}."
+            )
+        else:
+            # Buckets exceed printed — subtract the overage from the largest
+            # other_* bucket on this side.
+            overage = int(gap) if gap == int(gap) else gap
+            largest = None
+            for sub, key, value in _side_buckets(result, side):
+                if key in _OTHER_KEYS and (largest is None or value > largest[2]):
+                    largest = (sub, key, value)
+            sub, key, _value = largest
+            result[side][sub][key] -= overage
+            result["warnings"].append(
+                f"Auto-removed {overage:,} from {key} to reconcile to printed "
+                f"{printed_label} (buckets exceeded the printed total)."
+            )
+    return run_tally(result)
 
 
 def sanity_check_other_buckets(result: dict) -> dict:
