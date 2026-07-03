@@ -39,8 +39,9 @@ RULES:
   non-current.
 - DEBT: combine ALL interest-bearing debt tranches (e.g. senior secured notes, senior
   unsecured notes, secured debt & finance leases, term debt, commercial paper, revolving
-  credit) into 'debt'. If the filing splits current vs non-current debt, put the current
-  portion in current.debt; if unclassified, put total debt in current.debt.
+  credit, long-term debt) into 'debt' — the schema's single debt bucket (under current).
+  Put ALL interest-bearing debt there whether the filing shows it as current or long-term.
+  Do NOT bury long-term debt in other_liabilities.
 - ACCRUED INTEREST, deferred items, and any miscellaneous payables must be mapped (usually
   other_liabilities / deferred_rev_and_tax) — never omitted, or liabilities will under-count.
 - Equity is NOT part of the buckets. Do not map equity lines into liability buckets.
@@ -79,6 +80,71 @@ After mapping, the sum of all asset buckets MUST equal printed Total Assets and 
 liability buckets MUST equal printed Total Liabilities. If assets fall short by roughly the
 size of a large custodial liability you mapped, you omitted the matching custodial asset — add
 it.
+
+BUCKET PLACEMENT RULES (map into the CORRECT bucket, not just any bucket that makes the total
+tie):
+
+1. RESPECT THE FILING'S CURRENT vs NON-CURRENT HEADERS. If the balance sheet has "Current
+   Assets" / "Current Liabilities" sections (most GAAP filings do), every line under those
+   headers MUST go into a CURRENT bucket, and everything else into a NON-CURRENT bucket. Never
+   put a line the filing lists as current into a non-current bucket or vice-versa.
+
+2. CASH & MARKETABLE SECURITIES: there is no dedicated cash bucket. Map cash, cash
+   equivalents, and current marketable/short-term securities into other_current_assets. Map
+   NON-current/long-term investments into investment_assets (or other_assets if it's a mixed
+   'other' line).
+
+3. PP&E vs REAL ESTATE:
+   - "Property, plant and equipment", "Property and equipment, net", "Property, net of
+     depreciation" -> ppe.
+   - real_estate_assets is ONLY for entities whose business is holding real estate (REITs:
+     "Real estate properties", "Buildings and improvements", "Land"). Do NOT put ordinary
+     operating PP&E into real_estate_assets.
+
+4. INTANGIBLES & GOODWILL: there is no separate intangibles/goodwill bucket. Map intangible
+   assets and goodwill into other_assets (non-current). Group them there — do not scatter into
+   unrelated buckets.
+
+5. CUSTODIAL / PERFORMANCE-BOND / CLEARING BALANCES: map to the side AND the current/non-
+   current level the filing shows. E.g. "Performance bonds and guaranty fund contributions"
+   listed under Current Assets -> other_current_assets; the matching one under Current
+   Liabilities -> other_current_liabilities. (Both sides must be mapped — see offsetting rule.)
+
+6. DEBT: all interest-bearing borrowings -> debt. The schema has a single debt bucket under
+   current — put ALL interest-bearing debt there, whether the filing shows it as current
+   (short-term/current portion) or long-term ("Long-term debt"). Do NOT bury long-term debt in
+   other_liabilities.
+
+7. other_* buckets are a LAST RESORT for lines with no specific bucket — not a dumping ground.
+   Only use them for genuinely miscellaneous items (and intangibles/goodwill per rule 4, and
+   custodial balances per rule 5). Never move a line that has a correct specific bucket (ppe,
+   accounts_trade_receivable, inventory, debt, etc.) into an other_* bucket.
+
+After mapping: verify (a) every current-section line is in a current bucket and every
+non-current line in a non-current bucket, AND (b) the bucket sums equal printed Total Assets
+and Total Liabilities.
+
+WORKED EXAMPLES (correct placement):
+
+Example A — CME (exchange/clearing house), assets:
+  Filing "Current Assets": Cash 2,391.2, Marketable securities 124.2, AR 935.5, Other current
+  515.0, Performance bonds 165,035.3.
+  -> other_current_assets = 2,391.2 + 124.2 + 515.0 + 165,035.3 = 168,065.7 ;
+     accounts_trade_receivable = 935.5
+  Filing non-current: Property net 355.4 -> ppe ; Intangibles 17,175.3 + 2,550.8 + Goodwill
+  10,506.0 + Other 2,404.5 -> other_assets = 32,636.6
+  Ties to printed 201,993.5. NOTE cash/securities/performance-bonds are CURRENT (not
+  other_assets), and 355.4 is ppe (not real_estate_assets).
+
+Example B — REIT (e.g. Diversified Healthcare Trust):
+  "Real estate properties, net" -> real_estate_assets (this IS the business). Property lines
+  here are real_estate_assets, NOT ppe. (Contrast with Example A.)
+
+Example C — Apple (classified GAAP):
+  Current: Cash + current marketable securities + other current -> other_current_assets ;
+  AR + vendor receivables -> accounts_trade_receivable ; Inventory -> inventory.
+  Non-current: PP&E net -> ppe ; non-current marketable securities -> investment_assets ;
+  Intangibles + other non-current -> other_assets.
 
 If you are given a CORRECTION note describing an over- or under-count, fix ONLY the indicated
 issue: move the offending amount out of / into the correct other_* bucket so every line is
@@ -159,9 +225,9 @@ def _build_user_message(markdown: str) -> str:
         "tax assets -> non_current.other_assets.\n"
         "- Right-of-use assets -> lease_assets (non_current unless the "
         "filing shows a current portion).\n"
-        "- Long-term/non-current debt (net of the current portion) -> "
-        "non_current.other_liabilities (the non_current section has NO debt "
-        "bucket).\n"
+        "- ALL interest-bearing debt, including long-term debt -> "
+        "current.debt (the schema's only debt bucket; never "
+        "other_liabilities).\n"
         "- Real estate blocks (Land / Buildings and improvements / less "
         "Accumulated depreciation) belong TOGETHER in exactly ONE bucket: "
         "real_estate_assets for REITs/property companies (include the "

@@ -11,6 +11,7 @@ Diversified Healthcare Trust 10-Q (dollars in thousands):
     filing_totals.total_assets      == 4,267,552
     filing_totals.total_liabilities == 2,647,133
     both sides balanced.
+    real_estate_assets ~= 3,818,886 (REIT property stays real_estate, NOT ppe)
 Known trap: accrued interest (26,078) must land in other_liabilities, or the
 liabilities sum to 2,621,055 and the tally fails — the re-prompt step should
 catch and fix this.
@@ -25,11 +26,18 @@ the single-bucket rule + diagnosis re-prompt must prevent/self-correct it.
 CME Group 10-Q, March 31 2026 (dollars in millions) — custodial-asset regression:
     filing_totals.total_assets == 201,993, total_liabilities == 175,375
     both sides balanced (asset buckets sum to 201,993, liability buckets to 175,375).
-Known trap: the clearing-house performance-bond/guaranty-fund collateral appears
-on BOTH sides (~165,922 liability, ~165,035 matching cash/securities asset). The
-LLM used to map only the liability side and drop the asset — assets summed to
-36,958 (gap -165,035) and the service returned it unbalanced. The custodial
-asset must now land in other_assets/other_current_assets so assets tie.
+    ppe ~= 355.4 ; real_estate_assets == 0 (operating property is ppe, not real estate)
+    accounts_trade_receivable == 935.5
+    other_current_assets >= 168,000 (cash 2,391.2 + securities 124.2 + other 515.0
+        + performance bonds 165,035.3 = 168,065.7 — all CURRENT, per the filing headers)
+    other_assets (non-current) ~= 32,637 (intangibles + goodwill + other only)
+Known traps: (1) the clearing-house performance-bond/guaranty-fund collateral
+appears on BOTH sides (~165,922 liability, ~165,035 matching cash/securities
+asset). The LLM used to map only the liability side and drop the asset — assets
+summed to 36,958 (gap -165,035) and the service returned it unbalanced.
+(2) mapping-quality regression: the LLM then swept current items + intangibles
++ the custodial asset into NON-current other_assets (197,672) and put operating
+property (355.4) into real_estate_assets — tally passed but placement was wrong.
 """
 
 import json
@@ -48,6 +56,7 @@ def check_dhc(result: dict) -> list[str]:
     failures = []
     tally = result["tally"]
     totals = result["filing_totals"]
+    non_current = result["assets"]["non_current"]
     if totals["total_assets"] != 4267552:
         failures.append(f"total_assets {totals['total_assets']:,} != 4,267,552")
     if totals["total_liabilities"] != 2647133:
@@ -56,6 +65,11 @@ def check_dhc(result: dict) -> list[str]:
         failures.append("assets_balanced is False")
     if not tally["liabilities_balanced"]:
         failures.append("liabilities_balanced is False")
+    if abs(non_current["real_estate_assets"] - 3818886) > 1:
+        failures.append(
+            f"real_estate_assets {non_current['real_estate_assets']:,} != ~3,818,886 "
+            f"(REIT property must stay in real_estate_assets, not ppe)"
+        )
     return failures
 
 
@@ -80,6 +94,14 @@ def check_aapl(result: dict) -> list[str]:
             f"other_assets {non_current['other_assets']:,} != 98,764 "
             f"(148,780 would mean PP&E was double-counted)"
         )
+    # Cash (28,941) + current marketable securities (17,145) must sit in
+    # other_current_assets — current items never belong in non-current buckets.
+    current = result["assets"]["current"]
+    if current["other_current_assets"] < 46086:
+        failures.append(
+            f"other_current_assets {current['other_current_assets']:,} < 46,086 "
+            f"(cash + current marketable securities are missing from it)"
+        )
     return failures
 
 
@@ -102,14 +124,32 @@ def check_cme(result: dict) -> list[str]:
         failures.append("assets_balanced is False")
     if not tally["liabilities_balanced"]:
         failures.append("liabilities_balanced is False")
-    # The ~165,035 custodial/performance-bond asset (dropped pre-fix) must now
-    # sit in the other_* asset buckets.
-    other_total = (assets["non_current"]["other_assets"]
-                   + assets["current"]["other_current_assets"])
-    if other_total < 165035:
+    # Placement quality: current lines in current buckets, operating property
+    # in ppe, intangibles+goodwill grouped in non-current other_assets.
+    non_current = assets["non_current"]
+    current = assets["current"]
+    if abs(non_current["ppe"] - 355.4) > 1:
+        failures.append(f"ppe {non_current['ppe']:,} != ~355.4")
+    if non_current["real_estate_assets"] != 0:
         failures.append(
-            f"other_assets + other_current_assets = {other_total:,} < 165,035 "
-            f"(the custodial performance-bond asset is still missing)"
+            f"real_estate_assets {non_current['real_estate_assets']:,} != 0 "
+            f"(operating property belongs in ppe, not real_estate_assets)"
+        )
+    if current["accounts_trade_receivable"] != 935.5:
+        failures.append(
+            f"accounts_trade_receivable {current['accounts_trade_receivable']:,} != 935.5"
+        )
+    # Cash 2,391.2 + securities 124.2 + other 515.0 + performance bonds
+    # 165,035.3 = 168,065.7 — the custodial asset is CURRENT per the filing.
+    if current["other_current_assets"] < 168000:
+        failures.append(
+            f"other_current_assets {current['other_current_assets']:,} < 168,000 "
+            f"(current items / the performance-bond asset are missing from it)"
+        )
+    if abs(non_current["other_assets"] - 32636.6) > 1:
+        failures.append(
+            f"other_assets {non_current['other_assets']:,} != ~32,636.6 "
+            f"(should hold intangibles + goodwill + other non-current only)"
         )
     return failures
 
