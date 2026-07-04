@@ -18,6 +18,7 @@ Run:
     uvicorn backend:app --reload --port 8000
 """
 
+import asyncio
 import json
 import os
 import re
@@ -3312,6 +3313,85 @@ _OPTIONS_COUNTRY_TO_SOURCE = {
     "mexico": "mexico",
 }
 
+# Exchange prefixes seen in "EXCHANGE:TICKER" inputs (GuruFocus / Capital IQ /
+# Excel workbook style, e.g. "LSE:GSK", "SGX:Z77") -> the country whose market
+# handler serves that listing. Only unambiguous prefixes are listed — e.g.
+# "TSE" (Toronto vs Tokyo) and "OSE" (Oslo vs Osaka) are deliberately omitted;
+# an unknown prefix is stripped without changing the caller's country.
+_TICKER_EXCHANGE_PREFIX_TO_COUNTRY = {
+    # US
+    "NYSE": "United States", "NASDAQ": "United States", "NAS": "United States",
+    "AMEX": "United States", "ARCA": "United States", "BATS": "United States",
+    # UK
+    "LSE": "United Kingdom", "LON": "United Kingdom",
+    # Canada
+    "TSX": "Canada", "TSXV": "Canada", "CVE": "Canada",
+    # Japan
+    "TYO": "Japan", "JPX": "Japan",
+    # South Korea
+    "KRX": "South Korea", "KOSDAQ": "South Korea", "KOSE": "South Korea",
+    # China
+    "SHSE": "China", "SZSE": "China", "SHA": "China", "SHE": "China",
+    # Hong Kong
+    "HKSE": "Hong Kong", "HKG": "Hong Kong", "SEHK": "Hong Kong", "HKEX": "Hong Kong",
+    # Taiwan
+    "TPE": "Taiwan", "TWSE": "Taiwan", "ROCO": "Taiwan",
+    # India
+    "NSE": "India", "BSE": "India", "BOM": "India",
+    # Indonesia
+    "IDX": "Indonesia", "JKT": "Indonesia",
+    # Israel
+    "TASE": "Israel", "TLV": "Israel",
+    # Malaysia
+    "KLSE": "Malaysia", "MYX": "Malaysia",
+    # Thailand
+    "SET": "Thailand", "BKK": "Thailand",
+    # Brazil
+    "BOVESPA": "Brazil", "BVMF": "Brazil", "SAO": "Brazil",
+    # Germany
+    "XETRA": "Germany", "ETR": "Germany", "FRA": "Germany", "XTER": "Germany",
+    # Singapore
+    "SGX": "Singapore",
+    # Mexico
+    "BMV": "Mexico", "MEX": "Mexico",
+    # Denmark
+    "CPH": "Denmark", "OMXC": "Denmark",
+    # EU/EEA (ESEF)
+    "EPA": "France", "PAR": "France",
+    "AMS": "Netherlands",
+    "BIT": "Italy", "MIL": "Italy",
+    "BME": "Spain", "MCE": "Spain", "MAD": "Spain",
+    "STO": "Sweden",
+    "HEL": "Finland",
+    "OSL": "Norway",
+    "EBR": "Belgium", "BRU": "Belgium",
+    "VIE": "Austria", "WBAG": "Austria",
+    "LIS": "Portugal", "ELI": "Portugal",
+    "WSE": "Poland", "WAR": "Poland",
+    "ATH": "Greece",
+    "ISE": "Ireland",
+}
+
+
+def _normalize_ticker_and_country(ticker, country):
+    """Tolerate exchange-prefixed tickers from Excel/GuruFocus-style clients
+    (e.g. "LSE:GSK", "NYSE:UHS"): strip the "EXCHANGE:" prefix — EDGAR and the
+    other market fetchers reject the colon — and when the prefix names a known
+    exchange let it override `country`, since the listing venue is more specific
+    than the caller's country field. Unknown prefixes are stripped without
+    touching the country. Returns (ticker, country), both stripped."""
+    ticker = (ticker or "").strip()
+    country = (country or "").strip()
+    if ":" in ticker:
+        prefix, _, rest = ticker.partition(":")
+        mapped = _TICKER_EXCHANGE_PREFIX_TO_COUNTRY.get(prefix.strip().upper())
+        if rest.strip():
+            ticker = rest.strip()
+        if mapped:
+            country = mapped
+    return ticker, country
+
+
 # EU/EEA member states served by the pan-EU ESEF source (extract_from_eu).
 _OPTIONS_EU_COUNTRIES = {
     "france", "netherlands", "the netherlands", "spain", "italy", "sweden", "finland",
@@ -3332,9 +3412,8 @@ def _route_options_request(payload, edgar_default_form: str = "10-K"):
     `edgar_default_form` is the US form used when the payload gives none:
     "10-K" for the extraction endpoints; the fetch-filing endpoint passes
     "LATEST" (newest of 10-K/10-Q, resolved in edgar_fetch)."""
-    ticker = (payload.ticker or "").strip()
+    ticker, country = _normalize_ticker_and_country(payload.ticker, payload.country)
     company_name = (payload.company_name or "").strip()
-    country = (payload.country or "").strip()
     if not country:
         raise HTTPException(status_code=400, detail="country is required")
     if not ticker and not company_name:
@@ -3595,26 +3674,138 @@ async def fetch_filing(payload: FetchFilingRequest):
     )
 
 
-@app.post("/api/balance-sheet/standardize")
-async def balance_sheet_standardize(payload: FetchFilingRequest):
-    """Fetch the company's most recent filing (same inputs + same per-market
-    routing as /api/fetch-filing: {ticker, company_name, country, form?}) and
-    run the Balance_sheet standardization pipeline on the fetched PDF —
-    locate the balance-sheet pages (PyMuPDF), parse them to markdown
-    (LlamaParse), map into the fixed Damodaran-style schema (Together LLM),
-    and tally against the filing's printed totals. One call: input fields in,
-    final standardized JSON out. Blocks through fetch + parse + LLM — same
-    proxy-timeout caveat as /api/fetch-filing for slow markets."""
+# ── Balance-sheet standardize: async job pattern ─────────────────────
+# The fetch + LlamaParse + LLM standardize + tally run takes 30-90s — far too
+# long to hold a client connection open (Excel freezes; proxies return
+# 499/timeout). So POST returns a job_id in <1s and the work runs in the
+# background; the client polls GET /api/balance-sheet/status until the job
+# leaves "pending". In-process dict store — requires a SINGLE uvicorn worker
+# (--workers 1) so every poll sees the same dict (see Balance_sheet/README.md).
+
+BS_JOBS: dict[str, dict] = {}
+BS_JOB_TTL_SECONDS = 30 * 60
+
+# Hard references to in-flight tasks — asyncio only keeps weak refs, so an
+# unreferenced task can be garbage-collected mid-run.
+_BS_TASKS: set = set()
+
+
+def _bs_cleanup_jobs():
+    """Drop balance-sheet jobs older than the TTL so the dict never grows
+    forever. Called on each POST (the only place the dict grows)."""
+    cutoff = time.time() - BS_JOB_TTL_SECONDS
+    for jid in [j for j, rec in BS_JOBS.items()
+                if (rec.get("created") or 0) < cutoff]:
+        BS_JOBS.pop(jid, None)
+
+
+async def _bs_run_job(bs_job_id: str, payload: FetchFilingRequest):
+    """Background worker: fetch the filing PDF then run the (unchanged)
+    Balance_sheet standardization pipeline, recording the outcome in BS_JOBS.
+    Never raises — every failure lands in the store as status=error."""
     from fastapi.concurrency import run_in_threadpool
 
     from Balance_sheet.pipeline import run_pipeline as run_balance_sheet
 
+    try:
+        job_id, pdf_path, job = await _fetch_filing_pdf(payload)
+
+        # The pipeline itself never crashes — failures come back as JSON with
+        # "warnings" (and an "error" field), passed through inside the result.
+        result = await run_in_threadpool(run_balance_sheet, str(pdf_path))
+        BS_JOBS[bs_job_id] = {"status": "done", "result": result,
+                              "created": time.time()}
+    except HTTPException as exc:
+        # _fetch_filing_pdf raises 502 with {"error", "error_code", ...} when
+        # the fetch fails (registry miss, no report, config, ...).
+        detail = exc.detail
+        if isinstance(detail, dict):
+            error = str(detail.get("error") or detail)
+            error_code = detail.get("error_code") or "NO_REPORT"
+        else:
+            error = str(detail)
+            error_code = "NO_REPORT" if exc.status_code == 502 else "INTERNAL"
+        BS_JOBS[bs_job_id] = {"status": "error", "error": error,
+                              "error_code": error_code, "created": time.time()}
+    except Exception as e:
+        BS_JOBS[bs_job_id] = {"status": "error", "error": str(e),
+                              "error_code": "INTERNAL", "created": time.time()}
+
+
+@app.post("/api/balance-sheet/standardize", status_code=202)
+async def balance_sheet_standardize(payload: FetchFilingRequest):
+    """Start a balance-sheet standardization job (same inputs + same
+    per-market routing as /api/fetch-filing: {ticker, company_name, country,
+    form?}) and return IMMEDIATELY with a job_id — the fetch + LlamaParse +
+    LLM standardize + tally all run in the background (logic unchanged).
+    Poll GET /api/balance-sheet/status?job_id=<id> for the result."""
+    # Validate the body up front (400 on missing/unsupported input) — pure
+    # routing check, no job created, nothing fetched.
+    _route_options_request(payload, edgar_default_form="LATEST")
+
+    _bs_cleanup_jobs()
+
+    bs_job_id = uuid.uuid4().hex
+    BS_JOBS[bs_job_id] = {"status": "pending", "created": time.time()}
+
+    task = asyncio.create_task(_bs_run_job(bs_job_id, payload))
+    _BS_TASKS.add(task)
+    task.add_done_callback(_BS_TASKS.discard)
+
+    return JSONResponse(status_code=202,
+                        content={"job_id": bs_job_id, "status": "pending"})
+
+
+@app.get("/api/balance-sheet/status")
+async def balance_sheet_status(job_id: str = ""):
+    """Poll a balance-sheet standardization job. Pure dict lookup — never does
+    any work. Returns pending / done (with the full standardized JSON merged
+    in, same shape the old synchronous endpoint returned) / error."""
+    rec = BS_JOBS.get(job_id)
+    if rec is None:
+        return JSONResponse(status_code=404,
+                            content={"status": "error",
+                                     "error": "unknown job_id"})
+    if rec["status"] == "done":
+        return JSONResponse(content={"job_id": job_id, "status": "done",
+                                     **(rec.get("result") or {})})
+    if rec["status"] == "error":
+        return JSONResponse(content={"job_id": job_id, "status": "error",
+                                     "error": rec.get("error"),
+                                     "error_code": rec.get("error_code")})
+    return {"job_id": job_id, "status": "pending"}
+
+
+@app.post("/api/balance-sheet/excel")
+async def balance_sheet_excel(payload: FetchFilingRequest):
+    """Same workflow as /api/balance-sheet/standardize (same inputs, same
+    per-market fetch routing, same Stage 1 page location + Stage 2 LlamaParse)
+    — but instead of standardizing, the balance sheet is written to an Excel
+    workbook AS PRINTED: every line item and every value copied as-is, no
+    summarizing, no schema mapping, no LLM call. Streams back the .xlsx.
+    Blocks through fetch + parse — same proxy-timeout caveat as
+    /api/fetch-filing for slow markets."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from Balance_sheet.raw_excel import run_raw_pipeline
+
     job_id, pdf_path, job = await _fetch_filing_pdf(payload)
 
-    # The pipeline itself never crashes — failures come back as JSON with
-    # "warnings" (and an "error" field), which we pass through to the caller.
-    result = await run_in_threadpool(run_balance_sheet, str(pdf_path))
-    return JSONResponse(content=result)
+    xlsx_path = get_job_dir(job_id) / f"{pdf_path.stem}_balance_sheet.xlsx"
+    try:
+        await run_in_threadpool(run_raw_pipeline, str(pdf_path), str(xlsx_path))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={"job_id": job_id, "error": str(exc)},
+        )
+
+    return FileResponse(
+        path=xlsx_path,
+        filename=xlsx_path.name,
+        media_type=("application/vnd.openxmlformats-officedocument"
+                    ".spreadsheetml.sheet"),
+    )
 
 
 @app.get("/api/excel/options")
@@ -3646,8 +3837,9 @@ async def excel_options(
     field describing what happened."""
     from core.excel_options import map_plans_to_excel
 
-    ticker = (ticker or "").strip()
-    country_norm = (country or "").strip()
+    # Same exchange-prefix normalization as the routing ("LSE:GSK" -> GSK, UK),
+    # so the is_us dual-form check and the ticker cache key see the real values.
+    ticker, country_norm = _normalize_ticker_and_country(ticker, country)
     currency = None
     try:
         if not ticker:

@@ -61,17 +61,41 @@ CLI test script:
 python -m Balance_sheet.test_sample test_data/dhc_10q.pdf
 ```
 
-API — wired into the main backend (recommended): one call with the same
-input fields as `/api/fetch-filing` fetches the company's most recent filing
-and returns the final standardized JSON:
+API — wired into the main backend (recommended), as an **asynchronous job**:
+the full run (fetch + LlamaParse + LLM + tally) takes 30-90s, so the POST no
+longer blocks through it. Instead it returns a `job_id` immediately (HTTP 202)
+and the work runs in the background; poll the status endpoint until the job
+leaves `pending`:
 
 ```bash
-# main backend (backend.py)
+# 1) start the job (same input fields as /api/fetch-filing; returns <1s)
 curl -X POST http://localhost:8000/api/balance-sheet/standardize \
   -H "Content-Type: application/json" \
   -d '{"ticker": "DHC", "company_name": "Diversified Healthcare Trust", "country": "USA"}'
 # optional: "form": "10-Q" (US only; default = truly latest 10-Q/10-K)
+# -> 202 {"job_id": "<id>", "status": "pending"}
+
+# 2) poll until status != "pending" (fast dict lookup, never does work)
+curl "http://localhost:8000/api/balance-sheet/status?job_id=<id>"
+# still running: {"job_id": "<id>", "status": "pending"}
+# finished OK:   {"job_id": "<id>", "status": "done", ...full standardized JSON
+#                 (company, period, currency, unit_label, source_pages, assets,
+#                  liabilities, filing_totals, tally, warnings)...}
+# failed:        {"job_id": "<id>", "status": "error", "error": "<message>",
+#                 "error_code": "NO_REPORT" | "NOT_FOUND" | "CONFIG" | "INTERNAL" | ...}
+# unknown id:    404 {"status": "error", "error": "unknown job_id"}
 ```
+
+The `"done"` payload is exactly the JSON the old synchronous endpoint
+returned — the standardization logic and output schema are unchanged.
+
+**Job store: in-process dict, single worker required.** Jobs live in an
+in-memory dict inside the backend process (no Redis/SQLite), with a ~30-min
+TTL cleanup. This means the app must run with a **single worker**
+(`uvicorn backend:app --workers 1`, the uvicorn default) — with multiple
+workers/replicas the poll could land on a process that never saw the job_id
+and 404. On Railway (or any multi-replica deploy) keep one worker per the
+above, or swap the dict for a shared store.
 
 Standalone app (local PDF path or upload, no fetch):
 
