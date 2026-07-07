@@ -38,4 +38,3 @@ cloudflared.exe
 logs/
 test_data/
 downloads/
-sws_url_cache.json
