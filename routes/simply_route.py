@@ -35,6 +35,22 @@ _HEADERS = ["Period", "Revenue", "EPS", "Earnings", "CFO"]
 router = APIRouter()
 
 
+def _split_exchange_prefix(ticker: str, exchange: str | None):
+    """Tolerate exchange-prefixed tickers from Excel/GuruFocus-style clients
+    (e.g. "NYSE:IBM", "LSE:GSK"): strip the "EXCHANGE:" prefix and, when no
+    explicit exchange hint was given, reuse the prefix as the hint — find_url
+    only feeds it into a search query, so a rough hint is fine. An explicit
+    `exchange` query param always wins. Returns (ticker, exchange)."""
+    ticker = (ticker or "").strip()
+    if ":" in ticker:
+        prefix, _, rest = ticker.partition(":")
+        if rest.strip():
+            ticker = rest.strip()
+            if prefix.strip() and not (exchange or "").strip():
+                exchange = prefix.strip().lower()
+    return ticker, exchange
+
+
 def _scrape(ticker: str, exchange: str | None):
     """Run the SWS scraper for one ticker. Returns (page_url, rows)."""
     ticker = (ticker or "").strip()
@@ -67,6 +83,7 @@ def api_simply(
     exchange: str | None = Query(None, description="Optional exchange hint: nasdaq, lse, xtra ..."),
 ):
     """Ticker [+ exchange] -> Simply Wall St forward forecast (JSON)."""
+    ticker, exchange = _split_exchange_prefix(ticker, exchange)
     url, rows = _scrape(ticker, exchange)
     return {"ticker": ticker.upper(), "page": url, "columns": _COLUMNS, "rows": rows}
 
@@ -77,6 +94,7 @@ def api_simply_grouped(
     exchange: str | None = Query(None, description="Optional exchange hint: nasdaq, lse, xtra ..."),
 ):
     """Same forecast, grouped per-metric as {period, value} arrays (rev_est, eps_est)."""
+    ticker, exchange = _split_exchange_prefix(ticker, exchange)
     _, rows = _scrape(ticker, exchange)
 
     def _series(col):
@@ -99,6 +117,7 @@ def api_simply_excel(
     """The same forecast as a downloadable .xlsx (US$m)."""
     from openpyxl import Workbook
 
+    ticker, exchange = _split_exchange_prefix(ticker, exchange)
     _, rows = _scrape(ticker, exchange)
     wb = Workbook()
     ws = wb.active
