@@ -13,6 +13,11 @@ How it works (fast, no browser, no API):
   4. pull the forward consensus from analysis.future.merged_future_* (December year-ends)
      plus the most recent December figure from the statement blob
 
+Datacenter deploys (Railway etc.): DuckDuckGo/Bing block datacenter IPs, and
+simplywall.st sits behind Cloudflare. When the free path fails, steps 1 and 2
+fall back to Firecrawl (residential proxies) if FIRECRAWL_API_KEY is set —
+successes are cached in sws_url_cache.json so each ticker costs credits once.
+
 These two SWS chart blocks are the source:
   - "Earnings and Revenue Growth Forecasts"      -> merged_future_revenue
   - "Earnings per Share Growth Forecasts"        -> merged_future_earnings_per_share
@@ -20,7 +25,7 @@ These two SWS chart blocks are the source:
 Note: numbers are S&P data redistributed by SWS — for personal model use, not redistribution.
 """
 
-import argparse, csv, json, re, sys, time, random
+import argparse, csv, json, os, re, sys, time, random
 from datetime import datetime, timezone
 from urllib.parse import unquote
 
@@ -81,6 +86,56 @@ def _blocked(html):
             and (len(html) < 20000 or "anomaly" in low or "unusual traffic" in low))
 
 
+# ── Firecrawl fallback (datacenter deploys where DDG/Bing/Cloudflare block) ──
+FC_SEARCH_EP = "https://api.firecrawl.dev/v1/search"
+FC_SCRAPE_EP = "https://api.firecrawl.dev/v1/scrape"
+
+
+def _fc_key():
+    return os.environ.get("FIRECRAWL_API_KEY", "").strip()
+
+
+def _fc_post(endpoint, body, timeout=120):
+    r = http.post(endpoint, headers={"Authorization": "Bearer " + _fc_key(),
+                                     "Content-Type": "application/json"},
+                  json=body, timeout=timeout)
+    j = r.json()
+    if r.status_code != 200 or not j.get("success") or "data" not in j:
+        raise RuntimeError(f"http={r.status_code} body={str(j)[:200]}")
+    return j["data"]
+
+
+def _firecrawl_find(ticker, exchange, debug=False):
+    """Search via Firecrawl (residential proxies) when DDG/Bing are blocked.
+    Returns the /future URL or None (no key / no match)."""
+    if not _fc_key():
+        if debug: print("[debug] FIRECRAWL_API_KEY not set — skipping Firecrawl search", file=sys.stderr)
+        return None
+    q = f"{ticker} {exchange or ''} Future Growth simply wall street".strip()
+    try:
+        results = _fc_post(FC_SEARCH_EP, {"query": q, "limit": 8}, timeout=90)
+    except Exception as e:
+        if debug: print(f"[debug] firecrawl search error: {e}", file=sys.stderr)
+        return None
+    return _parse(" ".join(str(it.get("url") or "") for it in (results or [])), ticker)
+
+
+def _firecrawl_page_html(url, debug=False):
+    """Fetch a simplywall.st page through Firecrawl when the direct fetch is
+    Cloudflare-blocked. Returns raw HTML (state blob is server-rendered, so it
+    survives) or None."""
+    if not _fc_key():
+        return None
+    try:
+        data = _fc_post(FC_SCRAPE_EP, {"url": url, "formats": ["rawHtml"],
+                                       "waitFor": 3000, "timeout": 60000,
+                                       "proxy": "auto", "blockAds": True})
+        return data.get("rawHtml") or None
+    except Exception as e:
+        if debug: print(f"[debug] firecrawl scrape error: {e}", file=sys.stderr)
+        return None
+
+
 def find_url(s, ticker, exchange, debug=False):
     key = f"{ticker.upper()}|{(exchange or '').lower()}"
     cache = _cache()
@@ -103,12 +158,24 @@ def find_url(s, ticker, exchange, debug=False):
                 if debug: print(f"[debug] {engine} blocked ({len(html)}b), backoff {wait:.1f}s", file=sys.stderr)
                 time.sleep(wait); continue
             break
+    url = _firecrawl_find(ticker, exchange, debug)
+    if url:
+        cache[key] = url; json.dump(cache, open(CACHE_FILE, "w"))
+        return url
     raise SystemExit(f"No SWS page found for {ticker}. Try --exchange, or run with --debug.")
 
 
 def get_state(s, url):
-    html = s.get(url, timeout=30).text
-    return parse_state(html)
+    try:
+        html = s.get(url, timeout=30).text
+        return parse_state(html)
+    except (Exception, SystemExit):
+        # Direct fetch blocked (Cloudflare on datacenter IPs) or blob missing —
+        # retry once through Firecrawl before giving up.
+        fc_html = _firecrawl_page_html(url)
+        if fc_html is None:
+            raise
+        return parse_state(fc_html)
 
 
 def parse_state(html):
