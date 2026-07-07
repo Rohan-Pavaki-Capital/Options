@@ -22,12 +22,6 @@ Extracts a company's balance sheet from a 10-Q/10-K PDF and maps it into a
    On imbalance the LLM is re-called **once** with the exact gap; if still
    unbalanced, the JSON is returned with `balanced=false` and a `warnings`
    entry naming the gap — never silently accepted.
-5. **Scale normalization** (`tally.convert_to_millions`, pure code, final
-   step) — the standard output scale is **millions**: filings printed "in
-   thousands" are divided by 1,000 and rounded to whole millions AFTER the
-   tally verified the printed numbers; filings already "in millions" pass
-   through exactly as printed. An unrecognized `unit_label` leaves the values
-   at printed scale with a warning (never guesses a divisor).
 
 `preferred_stock` / `mezzanine_equity` are captured but sit outside the
 liabilities tally (they're outside the printed "Total liabilities").
@@ -118,7 +112,7 @@ curl -X POST -F "file=@filing.pdf" http://localhost:8010/api/balance-sheet/stand
 ```json
 {
   "company": "", "period": "", "currency": "",
-  "unit_label": "in millions",
+  "unit_label": "thousands",
   "source_pages": [4, 5],
   "assets":      { "non_current": { ... }, "current": { ... } },
   "liabilities": { "non_current": { ... }, "current": { ... },
@@ -130,22 +124,19 @@ curl -X POST -F "file=@filing.pdf" http://localhost:8010/api/balance-sheet/stand
 }
 ```
 
-The returned values are always **in millions** (the standard output scale):
-extraction and the tally verification happen at the filing's printed scale,
-then the final step converts thousands-scale filings to whole millions.
-Filings already in millions are returned exactly as printed.
+`unit_label` is for labelling only — numbers are **never** scaled; they are
+exactly as printed in the filing.
 
 ## Documented example (test expectation)
 
-For a **Diversified Healthcare Trust 10-Q** (dollars in thousands — returned
-values converted to whole millions by the final step):
+For a **Diversified Healthcare Trust 10-Q** (dollars in thousands):
 
 | Check | Expected |
 |---|---|
-| `filing_totals.total_assets` | 4,268 (printed 4,267,552 thousand) |
-| `filing_totals.total_liabilities` | 2,647 (printed 2,647,133 thousand) |
-| sum of asset buckets | ties at printed scale (`assets_balanced = true`) |
-| sum of liability buckets | ties at printed scale (`liabilities_balanced = true`) |
+| `filing_totals.total_assets` | 4,267,552 |
+| `filing_totals.total_liabilities` | 2,647,133 |
+| sum of asset buckets | 4,267,552 (`assets_balanced = true`) |
+| sum of liability buckets | 2,647,133 (`liabilities_balanced = true`) |
 
 Known trap: **accrued interest (26,078) must land in `other_liabilities`**,
 otherwise liabilities sum to 2,621,055 and the tally fails — the Stage-4

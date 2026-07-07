@@ -29,23 +29,10 @@ RULES:
   columns entirely.
 - Copy numbers EXACTLY as printed. Do NOT convert units, scale, or round. Strip only the
   currency symbol and thousands separators (commas). Negative numbers stay negative.
-- Map EVERY asset line into exactly one asset bucket OR memo field, and EVERY liability line
-  into exactly one liability bucket OR memo field. Do not drop any line. If a line has no
-  obvious home, put it in the closest 'other_*' bucket (other_assets / other_current_assets /
-  other_liabilities / other_current_liabilities) so the totals still reconcile.
-- MEMO FIELDS (the downstream workbook consumes these separately — they are NOT buckets and
-  their lines must NEVER also appear in any bucket):
-  - memo.cash_and_st_investments = ONLY lines explicitly named cash / cash equivalents /
-    short-term investments / current marketable securities. NOT "other current assets", NOT
-    prepaid expenses, NOT restricted cash, NOT custodial/performance-bond balances (all of
-    those stay in the buckets), NOT long-term investments (investment_assets).
-  - memo.goodwill_and_intangibles = printed goodwill + identifiable/other intangible asset
-    lines. This includes lines named ONLY "Intangible assets, net" / "Acquired intangibles"
-    etc. — the word goodwill need not appear. Only lines the filing prints as
-    goodwill/intangibles — a mixed "other non-current assets" line that merely INCLUDES
-    intangibles stays in other_assets.
-  - memo.long_term_debt = non-current interest-bearing debt (long-term debt, non-current
-    borrowings, bonds/notes due beyond one year).
+- Map EVERY asset line into exactly one asset bucket, and EVERY liability line into exactly
+  one liability bucket. Do not drop any line. If a line has no obvious bucket, put it in the
+  closest 'other_*' bucket (other_assets / other_current_assets / other_liabilities /
+  other_current_liabilities) so the totals still reconcile.
 - Distinguish current vs non-current using the filing's own sub-headers when present. If the
   filing is unclassified (common for REITs/banks), use judgement: cash, receivables,
   inventory, short-term items -> current; property, long-term investments, intangibles ->
@@ -53,20 +40,18 @@ RULES:
 - DEBT SPLIT: map interest-bearing debt by the filing's current/non-current classification.
   - Current portion of long-term debt, notes payable, short-term borrowings, commercial paper,
     current debt -> current.debt.
-  - Long-term debt / non-current borrowings -> memo.long_term_debt (there is no non-current
-    debt bucket; long-term debt is a memo field, NEVER other_liabilities).
+  - Long-term debt / non-current borrowings -> non_current.other_liabilities (the schema has no
+    non-current debt bucket - group long-term debt there).
   Never lump long-term debt into current.debt.
   (If the filing is unclassified, use judgement: revolvers/commercial paper/current maturities
-  -> current.debt; term debt, notes and bonds -> memo.long_term_debt.)
-- DEFERRED TAX / INCOME TAX:
-  - A PURE deferred income tax (or deferred revenue) liability line -> deferred_rev_and_tax
-    (current or non-current per the filing).
-  - A COMBINED line like "Deferred income taxes and other liabilities" -> non_current
-    other_liabilities as a whole (exactly ONE bucket; do not split unless the filing itself
-    splits it; deferred_rev_and_tax then stays 0 unless a pure deferred line also exists).
-  - Income taxes payable (current) -> current.deferred_rev_and_tax.
-  - Accrued liabilities -> other_current_liabilities.
-  Do not double-count: each of these lines goes to exactly one bucket.
+  -> current.debt; term debt, notes and bonds -> non_current.other_liabilities.)
+- Deferred income tax liabilities -> deferred_rev_and_tax (current or non-current per the filing).
+  When a filing combines "Deferred income taxes and other liabilities" on one line, map the whole
+  line to the non-current bucket that matches its dominant nature (deferred_rev_and_tax if it is
+  primarily deferred tax; otherwise other_liabilities) - but map it to exactly ONE bucket, do not
+  split unless the filing itself splits it. Do not double-count accrued liabilities and income
+  taxes payable - each line goes to exactly one current bucket (accrued -> other_current_liabilities,
+  income taxes payable -> other_current_liabilities or deferred_rev_and_tax per filing).
 - ACCRUED INTEREST and any miscellaneous payables must be mapped (usually other_liabilities /
   other_current_liabilities) — never omitted, or liabilities will under-count.
 - Equity is NOT part of the buckets. Do not map equity lines into liability buckets.
@@ -90,75 +75,18 @@ RULES:
 - unit_label: copy the scale wording from the filing header ("in thousands"/"in millions")
   for labelling only. Never use it to scale the numbers.
 
-FIELD-BY-FIELD MAPPING TABLE (filing particulars -> template field; this is the canonical
-mapping — the rules above/below refine edge cases):
-
-Assets, non-current:
-- lease_assets            <- operating lease right-of-use (ROU) assets (non-current)
-- real_estate_assets      <- land / buildings / property held (where broken out — REITs and
-                             property companies only)
-- investment_assets       <- trading/investment securities held long-term
-- investment_in_other     <- long-term investments / equity-method investments / investments
-                             in affiliates, unconsolidated JVs or other companies
-- assets_held_for_sale    <- assets (of properties) held for sale
-- asset_from_discontinued_business <- assets of discontinued operations
-- pension_assets          <- pension / post-retirement plan assets (overfunded plans)
-- other_assets            <- deferred income tax assets + other non-current assets
-                             (EXCLUDING goodwill & intangibles — those are memo)
-- ppe                     <- property, plant & equipment, net
-
-Assets, current:
-- lease_assets (current)  <- current portion of lease/ROU assets
-- inventory               <- physical inventory / commodities
-- accounts_trade_receivable <- trade accounts receivable, net (+ vendor receivables)
-- tax                     <- current income tax receivable / current tax assets
-- other_current_assets    <- every remaining current line (prepaid expenses, restricted cash,
-                             misc current items) = total current assets minus the specific
-                             buckets minus cash items (cash/ST investments are memo, NEVER
-                             mapped here)
-
-Liabilities, non-current:
-- pension                 <- pension / post-retirement benefit obligations
-- lease_liabilities       <- operating lease liabilities, non-current
-- deferred_rev_and_tax    <- deferred revenue (non-current) + PURE deferred income tax
-                             liability lines
-- other_liabilities       <- other non-current liabilities (incl. combined "deferred income
-                             taxes and other liabilities" lines; NEVER long-term debt — memo)
-
-Liabilities, current:
-- debt                    <- short-term debt / borrowings + current portion of long-term debt
-                             + notes payable + commercial paper (long-term debt itself ->
-                             memo.long_term_debt)
-- lease_liabilities (current) <- operating lease liabilities, current
-- accounts_trade_payable  <- accounts payable
-- deferred_rev_and_tax (current) <- deferred revenue (current) + income taxes payable
-- other_current_liabilities <- accrued expenses & other current liabilities
-
-Equity-adjacent:
-- preferred_stock         <- genuine preferred stock only
-- mezzanine_equity        <- redeemable/temporary equity only — never ordinary common stock
-                             (e.g. NIKE Class B common "3" is ordinary equity, excluded from
-                             all buckets)
-
-Never mapped into any bucket (memo fields — the workbook adds them independently):
-cash + short-term investments -> memo.cash_and_st_investments ; goodwill and intangibles ->
-memo.goodwill_and_intangibles ; long-term debt -> memo.long_term_debt.
-
 SINGLE-BUCKET RULE (critical):
-- Every source line contributes to EXACTLY ONE bucket or memo field.
-- If a line is placed in a specific bucket or memo field (ppe, investment_assets,
-  real_estate_assets, inventory, accounts_trade_receivable, debt, accounts_trade_payable,
-  deferred_rev_and_tax, memo.cash_and_st_investments, memo.goodwill_and_intangibles,
-  memo.long_term_debt, etc.), it MUST NOT also be included in any other_* bucket.
+- Every source line contributes to EXACTLY ONE bucket.
+- If a line is placed in a specific bucket (ppe, investment_assets, real_estate_assets,
+  inventory, accounts_trade_receivable, debt, accounts_trade_payable, deferred_rev_and_tax,
+  etc.), it MUST NOT also be included in any other_* bucket.
 - other_* buckets (other_assets, other_current_assets, other_liabilities,
-  other_current_liabilities) contain ONLY the lines not already captured by a specific bucket
-  or memo field.
+  other_current_liabilities) contain ONLY the lines not already captured by a specific bucket.
 - Never take a subtotal AND its components. Map the individual line items, never a section
   subtotal (e.g. do not map "Total non-current assets" — map the lines under it).
-- Self-verify before returning: sum of ALL asset buckets + memo.cash_and_st_investments +
-  memo.goodwill_and_intangibles must equal printed Total Assets, and sum of ALL liability
-  buckets + memo.long_term_debt must equal printed Total Liabilities. If they do not, you have
-  either double-counted (same line in two places) or missed a line — fix it before returning.
+- Self-verify before returning: sum of ALL asset buckets must equal printed Total Assets, and
+  sum of ALL liability buckets must equal printed Total Liabilities. If they do not, you have
+  either double-counted (same line in two buckets) or missed a line — fix it before returning.
 
 OFFSETTING / CUSTODIAL BALANCES (critical for banks, brokers, exchanges, clearing houses):
 Performance-bond, guaranty-fund, margin deposits, segregated customer funds, and other
@@ -166,12 +94,11 @@ custodial balances appear on BOTH sides of the balance sheet in near-equal amoun
 entity holds cash/securities as an ASSET and owes them back as a LIABILITY. If you map such a
 balance as a liability (e.g. into other_current_liabilities), you MUST also map its
 corresponding asset (the cash and securities held as that collateral) into an asset bucket
-(other_current_assets or other_assets — custodial balances are NOT memo cash). NEVER map one
-side without the other.
-After mapping, asset buckets + asset memo fields MUST equal printed Total Assets and liability
-buckets + memo.long_term_debt MUST equal printed Total Liabilities. If assets fall short by
-roughly the size of a large custodial liability you mapped, you omitted the matching custodial
-asset — add it.
+(other_current_assets or other_assets). NEVER map one side without the other.
+After mapping, the sum of all asset buckets MUST equal printed Total Assets and the sum of all
+liability buckets MUST equal printed Total Liabilities. If assets fall short by roughly the
+size of a large custodial liability you mapped, you omitted the matching custodial asset — add
+it.
 
 BUCKET PLACEMENT RULES (map into the CORRECT bucket, not just any bucket that makes the total
 tie):
@@ -181,12 +108,10 @@ tie):
    headers MUST go into a CURRENT bucket, and everything else into a NON-CURRENT bucket. Never
    put a line the filing lists as current into a non-current bucket or vice-versa.
 
-2. CASH & MARKETABLE SECURITIES: map cash, cash equivalents, and current marketable /
-   short-term securities into memo.cash_and_st_investments — NEVER into other_current_assets.
-   Restricted cash and custodial balances stay in the buckets. NON-current holdings split per
-   the mapping table: long-term trading/investment securities -> investment_assets ;
-   long-term investments / equity-method / affiliate / JV stakes -> investment_in_other ;
-   a mixed 'other' line that merely includes investments -> other_assets.
+2. CASH & MARKETABLE SECURITIES: there is no dedicated cash bucket. Map cash, cash
+   equivalents, and current marketable/short-term securities into other_current_assets. Map
+   NON-current/long-term investments into investment_assets (or other_assets if it's a mixed
+   'other' line).
 
 3. PP&E vs REAL ESTATE:
    - "Property, plant and equipment", "Property and equipment, net", "Property, net of
@@ -195,10 +120,9 @@ tie):
      "Real estate properties", "Buildings and improvements", "Land"). Do NOT put ordinary
      operating PP&E into real_estate_assets.
 
-4. INTANGIBLES & GOODWILL: map lines the filing prints as goodwill or intangible assets into
-   memo.goodwill_and_intangibles — NEVER into other_assets. A mixed line ("Other assets" that
-   merely includes intangibles, or "Deferred income taxes and other assets") stays in
-   other_assets.
+4. INTANGIBLES & GOODWILL: there is no separate intangibles/goodwill bucket. Map intangible
+   assets and goodwill into other_assets (non-current). Group them there — do not scatter into
+   unrelated buckets.
 
 5. CUSTODIAL / PERFORMANCE-BOND / CLEARING BALANCES: map to the side AND the current/non-
    current level the filing shows. E.g. "Performance bonds and guaranty fund contributions"
@@ -207,58 +131,44 @@ tie):
 
 6. DEBT SPLIT: map interest-bearing debt by the filing's current/non-current classification —
    current portion of long-term debt, notes payable, short-term borrowings, commercial paper
-   -> current.debt ; long-term debt / non-current borrowings -> memo.long_term_debt (never
-   other_liabilities). Never lump long-term debt into current.debt.
+   -> current.debt ; long-term debt / non-current borrowings -> non_current.other_liabilities
+   (no non-current debt bucket exists). Never lump long-term debt into current.debt.
 
 7. other_* buckets are a LAST RESORT for lines with no specific bucket — not a dumping ground.
-   Only use them for genuinely miscellaneous items (and custodial balances per rule 5). Never
-   move a line that has a correct specific bucket or memo field (ppe,
-   accounts_trade_receivable, inventory, debt, cash, goodwill, long-term debt, etc.) into an
-   other_* bucket.
+   Only use them for genuinely miscellaneous items (and intangibles/goodwill per rule 4, and
+   custodial balances per rule 5). Never move a line that has a correct specific bucket (ppe,
+   accounts_trade_receivable, inventory, debt, etc.) into an other_* bucket.
 
 After mapping: verify (a) every current-section line is in a current bucket and every
-non-current line in a non-current bucket, AND (b) asset buckets + asset memo fields equal
-printed Total Assets and liability buckets + memo.long_term_debt equal printed Total
-Liabilities.
+non-current line in a non-current bucket, AND (b) the bucket sums equal printed Total Assets
+and Total Liabilities.
 
 WORKED EXAMPLES (correct placement):
 
-Example A — NIKE (classified GAAP 10-Q):
-  Current assets: Cash 6,660 + Short-term investments 1,397 -> memo.cash_and_st_investments =
-  8,057 ; AR net 5,369 -> accounts_trade_receivable ; Inventories 7,487 -> inventory ;
-  Prepaid expenses and other current assets 2,271 -> other_current_assets.
-  Non-current: PP&E net 4,766 -> ppe ; Operating lease right-of-use assets 2,886 ->
-  lease_assets ; Identifiable intangible assets 259 + Goodwill 240 ->
-  memo.goodwill_and_intangibles = 499 ; "Deferred income taxes and other assets" 5,729 ->
-  other_assets (mixed line, NOT memo).
-  Current liabilities: Current portion of long-term debt 999 -> current.debt ; Notes payable 0
-  -> current.debt ; Accounts payable 2,888 -> accounts_trade_payable ; Current portion of
-  operating lease liabilities 493 -> current.lease_liabilities ; Accrued liabilities 6,183 ->
-  other_current_liabilities ; Income taxes payable 275 -> current.deferred_rev_and_tax.
-  Non-current: Long-term debt 7,030 -> memo.long_term_debt ; Operating lease liabilities 2,656
-  -> non_current.lease_liabilities ; "Deferred income taxes and other liabilities" 2,450 ->
-  non_current.other_liabilities (combined line; deferred_rev_and_tax stays 0).
-  Asset buckets 28,508 + memo 8,057 + 499 = printed 37,064 ; liability buckets 15,944 + memo
-  7,030 = 22,974.
-
-Example B — CME (exchange/clearing house), assets:
-  Filing "Current Assets": Cash 2,391.2 + Marketable securities 124.2 ->
-  memo.cash_and_st_investments = 2,515.4 ; AR 935.5 -> accounts_trade_receivable ; Other
-  current 515.0 + Performance bonds 165,035.3 -> other_current_assets = 165,550.3 (custodial
-  collateral is NOT memo cash).
+Example A — CME (exchange/clearing house), assets:
+  Filing "Current Assets": Cash 2,391.2, Marketable securities 124.2, AR 935.5, Other current
+  515.0, Performance bonds 165,035.3.
+  -> other_current_assets = 2,391.2 + 124.2 + 515.0 + 165,035.3 = 168,065.7 ;
+     accounts_trade_receivable = 935.5
   Filing non-current: Property net 355.4 -> ppe ; Intangibles 17,175.3 + 2,550.8 + Goodwill
-  10,506.0 -> memo.goodwill_and_intangibles = 30,232.1 ; Other 2,404.5 -> other_assets.
-  Buckets + memo tie to printed 201,993.5. NOTE 355.4 is ppe (not real_estate_assets).
+  10,506.0 + Other 2,404.5 -> other_assets = 32,636.6
+  Ties to printed 201,993.5. NOTE cash/securities/performance-bonds are CURRENT (not
+  other_assets), and 355.4 is ppe (not real_estate_assets).
 
-Example C — REIT (e.g. Diversified Healthcare Trust):
+Example B — REIT (e.g. Diversified Healthcare Trust):
   "Real estate properties, net" -> real_estate_assets (this IS the business). Property lines
-  here are real_estate_assets, NOT ppe. (Contrast with Example B.)
-  "Investments in unconsolidated joint ventures" -> investment_in_other.
+  here are real_estate_assets, NOT ppe. (Contrast with Example A.)
+
+Example C — Apple (classified GAAP):
+  Current: Cash + current marketable securities + other current -> other_current_assets ;
+  AR + vendor receivables -> accounts_trade_receivable ; Inventory -> inventory.
+  Non-current: PP&E net -> ppe ; non-current marketable securities -> investment_assets ;
+  Intangibles + other non-current -> other_assets.
 
 If you are given a CORRECTION note describing an over- or under-count, fix ONLY the indicated
-issue: move the offending amount out of / into the correct bucket or memo field so every line
-is counted exactly once and buckets + memo fields equal the printed Total Assets and Total
-Liabilities. Return the full corrected JSON, same schema, numbers as printed.
+issue: move the offending amount out of / into the correct other_* bucket so every line is
+counted exactly once and the bucket sums equal the printed Total Assets and Total Liabilities.
+Return the full corrected JSON, same schema, numbers as printed.
 
 Return the JSON now.
 """
@@ -336,34 +246,18 @@ def _build_user_message(markdown: str) -> str:
         f"{items_block}"
         "MAPPING HINTS for lines with no named bucket (they must NEVER be "
         "dropped, or the totals will not reconcile):\n"
-        "- Cash and cash equivalents + short-term investments / current "
-        "marketable securities -> memo.cash_and_st_investments (NOT "
-        "other_current_assets). Prepaid expenses, restricted cash, current "
-        "derivative/receivable odds and ends -> current.other_current_assets.\n"
-        "- Goodwill and intangible-asset lines -> memo.goodwill_and_intangibles "
-        "(NOT other_assets). Non-current derivatives, deferred tax assets, "
-        "mixed 'deferred taxes and other assets' lines -> "
-        "non_current.other_assets.\n"
+        "- Cash and cash equivalents, short-term investments, prepaid "
+        "expenses, current derivative/receivable odds and ends -> "
+        "current.other_current_assets.\n"
+        "- Goodwill, intangible assets, non-current derivatives, deferred "
+        "tax assets -> non_current.other_assets.\n"
         "- Right-of-use assets -> lease_assets (non_current unless the "
-        "filing shows a current portion). Never fold ROU assets into ppe.\n"
-        "- Long-term trading/investment securities -> investment_assets ; "
-        "long-term investments / equity-method / affiliate / JV stakes -> "
-        "investment_in_other.\n"
-        "- Pension or post-retirement obligations -> non_current.pension ; "
-        "overfunded pension plan assets -> pension_assets.\n"
+        "filing shows a current portion).\n"
         "- Interest-bearing debt splits by the filing's classification: "
         "current portion of long-term debt / notes payable / short-term "
         "borrowings -> current.debt ; long-term debt / non-current "
-        "borrowings -> memo.long_term_debt (never lumped into current.debt "
-        "or other_liabilities).\n"
-        "- Income taxes payable -> current.deferred_rev_and_tax ; accrued "
-        "liabilities -> other_current_liabilities ; a combined 'deferred "
-        "income taxes and other liabilities' line -> non_current."
-        "other_liabilities as a whole.\n"
-        "- A printed line literally named 'Other liabilities' / 'Other "
-        "assets' maps straight into the matching other_* bucket (current "
-        "level per the filing's headers; non-current when unclassified) — "
-        "it must NEVER be dropped.\n"
+        "borrowings -> non_current.other_liabilities (never lumped into "
+        "current.debt).\n"
         "- Real estate blocks (Land / Buildings and improvements / less "
         "Accumulated depreciation) belong TOGETHER in exactly ONE bucket: "
         "real_estate_assets for REITs/property companies (include the "
@@ -449,15 +343,6 @@ def _validate(result: dict) -> None:
     for k in ("preferred_stock", "mezzanine_equity"):
         if k not in result["liabilities"]:
             raise ValueError(f"Missing key: liabilities.{k}")
-    memo = result.get("memo")
-    if not isinstance(memo, dict):
-        raise ValueError("Missing or invalid section: memo")
-    for k in config.MEMO_KEYS:
-        if k not in memo:
-            raise ValueError(f"Missing memo key: memo.{k}")
-    extra = set(memo) - set(config.MEMO_KEYS)
-    if extra:
-        raise ValueError(f"Invented memo keys: {sorted(extra)}")
     for k in ("total_assets", "total_liabilities"):
         if k not in result.get("filing_totals", {}):
             raise ValueError(f"Missing key: filing_totals.{k}")
@@ -519,11 +404,7 @@ def restandardize(markdown: str, previous_json: dict, gap_message: str) -> dict:
         {
             "role": "user",
             "content": (
-                f"CORRECTION note: {gap_message} Cross-check the LINE ITEMS "
-                "checklist first: EVERY asset/liability line in it must appear "
-                "in exactly one bucket or memo field — find the line(s) you "
-                "left out or double-counted; the gap equals their sum. Then "
-                "correct the previous JSON with the SMALLEST "
+                f"CORRECTION note: {gap_message} Correct the previous JSON with the SMALLEST "
                 "possible edit: change ONLY the bucket(s) implicated by the "
                 "gap(s) above and copy every other bucket value UNCHANGED "
                 "from the previous JSON. When a bucket holds several lines, "
