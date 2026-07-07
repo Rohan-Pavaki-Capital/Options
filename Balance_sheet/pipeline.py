@@ -9,25 +9,36 @@ import logging
 import os
 
 from . import parser, pdf_locator, standardizer, tally
-from .config import TALLY_MAX_RETRIES, empty_result
+from .config import (
+    MEMO_ASSET_KEYS,
+    MEMO_LIABILITY_KEYS,
+    TALLY_MAX_RETRIES,
+    empty_result,
+)
 
 logger = logging.getLogger("balance_sheet.pipeline")
 
 
 def _merge_balanced_sides(first: dict, retry: dict) -> dict:
     """The tally re-prompt may fix one side while regressing the other. Assets
-    and liabilities buckets are disjoint, so keep — per side — whichever run
-    lands closer to its printed total; the retry wins only where it improves."""
+    and liabilities buckets (and their memo fields) are disjoint, so keep —
+    per side — whichever run lands closer to its printed total; the retry
+    wins only where it improves."""
     def gap(run: dict, side: str) -> float:
         return abs(run["tally"][f"sum_{side}"] - run["filing_totals"][f"total_{side}"])
 
     merged = retry
+    merged.setdefault("memo", {})
     if gap(first, "assets") < gap(retry, "assets"):
         merged["assets"] = first["assets"]
+        for k in MEMO_ASSET_KEYS:
+            merged["memo"][k] = first.get("memo", {}).get(k, 0)
         merged["filing_totals"]["total_assets"] = first["filing_totals"]["total_assets"]
         logger.info("Retry regressed the assets side — keeping first run's assets.")
     if gap(first, "liabilities") < gap(retry, "liabilities"):
         merged["liabilities"] = first["liabilities"]
+        for k in MEMO_LIABILITY_KEYS:
+            merged["memo"][k] = first.get("memo", {}).get(k, 0)
         merged["filing_totals"]["total_liabilities"] = first["filing_totals"]["total_liabilities"]
         logger.info("Retry regressed the liabilities side — keeping first run's liabilities.")
     tally.run_tally(merged)
@@ -102,7 +113,14 @@ def run_markdown_pipeline(markdown: str, source_pages: list | None = None,
     line_items = standardizer.extract_line_items(markdown)
     if len(line_items) >= 5:  # same reliability bar as the prompt checklist
         tally.guard_equity_adjacent_buckets(result, line_items)
+        tally.enforce_asset_placements(result, line_items)
     tally.sanity_check_other_buckets(result)
+
+    # Final step — standard output scale is millions (user decision
+    # 2026-07-07): thousands-scale filings are converted AFTER the tally
+    # verified the printed numbers; millions-scale filings pass through
+    # untouched.
+    tally.convert_to_millions(result)
 
     return result
 

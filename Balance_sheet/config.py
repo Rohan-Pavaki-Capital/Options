@@ -64,9 +64,11 @@ ASSET_CURRENT_KEYS = [
     "tax", "other_current_assets",
 ]
 
-# NOTE: the keys mirror the Excel template's rows EXACTLY — no extra fields.
-# There is deliberately no non-current debt bucket: long-term debt goes into
-# non_current.other_liabilities (user decision 2026-07-04, Excel template fixed).
+# NOTE: the bucket keys mirror the Excel template's rows EXACTLY — no extra
+# bucket fields. There is deliberately no non-current debt bucket and no cash
+# or goodwill bucket: those lines go into the MEMO section below (user
+# decision 2026-07-05 — the workbook's internal logic consumes them; they must
+# NOT be folded into the other_* buckets).
 LIABILITY_NON_CURRENT_KEYS = [
     "pension", "lease_liabilities", "deferred_rev_and_tax", "other_liabilities",
 ]
@@ -75,6 +77,15 @@ LIABILITY_CURRENT_KEYS = [
     "debt", "lease_liabilities", "accounts_trade_payable",
     "deferred_rev_and_tax", "other_current_liabilities",
 ]
+
+# Memo lines the Excel workbook handles with its own internal logic — kept OUT
+# of the buckets but still part of the tally verification:
+#   sum(asset buckets) + cash_and_st_investments + goodwill_and_intangibles
+#       == printed Total Assets
+#   sum(liability buckets) + long_term_debt == printed Total Liabilities
+MEMO_ASSET_KEYS = ["cash_and_st_investments", "goodwill_and_intangibles"]
+MEMO_LIABILITY_KEYS = ["long_term_debt"]
+MEMO_KEYS = MEMO_ASSET_KEYS + MEMO_LIABILITY_KEYS
 
 
 def empty_result() -> dict:
@@ -95,6 +106,7 @@ def empty_result() -> dict:
             "preferred_stock": 0,
             "mezzanine_equity": 0,
         },
+        "memo": {k: 0 for k in MEMO_KEYS},
         "filing_totals": {"total_assets": 0, "total_liabilities": 0},
         "tally": {
             "sum_assets": 0, "sum_liabilities": 0,

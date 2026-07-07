@@ -7,6 +7,7 @@ Also builds the exact-gap message used for the one-shot LLM re-prompt.
 """
 
 import logging
+import math
 import re
 
 from .config import (
@@ -14,6 +15,9 @@ from .config import (
     ASSET_NON_CURRENT_KEYS,
     LIABILITY_CURRENT_KEYS,
     LIABILITY_NON_CURRENT_KEYS,
+    MEMO_ASSET_KEYS,
+    MEMO_KEYS,
+    MEMO_LIABILITY_KEYS,
     PLUG_SUSPICIOUS_GAP,
     TALLY_TOLERANCE,
 )
@@ -67,6 +71,9 @@ def coerce_result_numbers(result: dict) -> dict:
         result["liabilities"][k] = coerce_number(
             result["liabilities"].get(k), warnings, f"liabilities.{k}"
         )
+    memo = result.setdefault("memo", {})
+    for k in MEMO_KEYS:
+        memo[k] = coerce_number(memo.get(k), warnings, f"memo.{k}")
     for k in ("total_assets", "total_liabilities"):
         result["filing_totals"][k] = coerce_number(
             result["filing_totals"].get(k), warnings, f"filing_totals.{k}"
@@ -75,15 +82,22 @@ def coerce_result_numbers(result: dict) -> dict:
 
 
 def _sum_assets(result: dict) -> float:
+    # Memo cash/goodwill are asset lines kept out of the buckets for the
+    # workbook — they still count toward the printed Total Assets.
     a = result["assets"]
-    return sum(a["non_current"].values()) + sum(a["current"].values())
+    memo = result.get("memo", {})
+    return (sum(a["non_current"].values()) + sum(a["current"].values())
+            + sum(memo.get(k, 0) for k in MEMO_ASSET_KEYS))
 
 
 def _sum_liabilities(result: dict) -> float:
     # preferred_stock / mezzanine_equity are equity-adjacent and sit OUTSIDE
     # the filing's printed "Total liabilities", so they are excluded here.
+    # memo.long_term_debt IS part of printed Total Liabilities.
     li = result["liabilities"]
-    return sum(li["non_current"].values()) + sum(li["current"].values())
+    memo = result.get("memo", {})
+    return (sum(li["non_current"].values()) + sum(li["current"].values())
+            + sum(memo.get(k, 0) for k in MEMO_LIABILITY_KEYS))
 
 
 _OTHER_KEYS = {
@@ -93,10 +107,16 @@ _OTHER_KEYS = {
 
 
 def _side_buckets(result: dict, side: str):
-    """Yield (subsection, key, value) for every bucket counted in the side's sum."""
+    """Yield (subsection, key, value) for every bucket counted in the side's
+    sum — including the side's memo fields (they behave like specific buckets
+    for diagnosis; they are never other_* plug targets)."""
     for sub in ("non_current", "current"):
         for key, value in result[side][sub].items():
             yield sub, key, value
+    memo_keys = MEMO_ASSET_KEYS if side == "assets" else MEMO_LIABILITY_KEYS
+    memo = result.get("memo", {})
+    for key in memo_keys:
+        yield "memo", key, memo.get(key, 0)
 
 
 def _diagnose_side(result: dict, side: str) -> dict:
@@ -189,8 +209,11 @@ def build_gap_message(result: dict) -> str:
         label = "Assets" if side == "assets" else "Liabilities"
         printed_label = "Total Assets" if side == "assets" else "Total Liabilities"
         other_hint = (
-            "other_assets (or other_current_assets)" if side == "assets"
-            else "other_liabilities (or other_current_liabilities)"
+            "other_current_assets if the filing lists the line under Current "
+            "Assets — e.g. performance bonds — else other_assets"
+            if side == "assets"
+            else "other_current_liabilities if listed under Current "
+            "Liabilities, else other_liabilities"
         )
         sum_v = tally[f"sum_{side}"]
         printed = totals[f"total_{side}"]
@@ -214,15 +237,22 @@ def build_gap_message(result: dict) -> str:
                     f"is counted exactly once. Return corrected JSON."
                 )
         else:
+            memo_hint = (
+                "cash/short-term investments (-> memo.cash_and_st_investments) "
+                "or goodwill/intangibles (-> memo.goodwill_and_intangibles)"
+                if side == "assets"
+                else "long-term debt (-> memo.long_term_debt)"
+            )
             parts.append(
-                f"{label} under by {abs(gap):,} (buckets sum to {sum_v:,} vs "
-                f"printed {printed_label} {printed:,}). A line summing to about "
-                f"{abs(gap):,} was not mapped. This is very often the custodial / "
+                f"{label} under by {abs(gap):,} (buckets + memo sum to {sum_v:,} "
+                f"vs printed {printed_label} {printed:,}). A printed line summing "
+                f"to about {abs(gap):,} was not mapped. Check first for unmapped "
+                f"{memo_hint}; otherwise it is very often the custodial / "
                 f"performance-bond / collateral {'ASSET' if side == 'assets' else 'balance'} "
                 f"that matches a large amount you already mapped on the other "
-                f"side (e.g. other_current_liabilities). Add {abs(gap):,} to "
-                f"{other_hint} so {side} tie to printed {printed_label}. "
-                f"Return corrected JSON."
+                f"side (-> {other_hint}). Map the missing printed line(s) to the "
+                f"correct bucket or memo field so {side} tie to printed "
+                f"{printed_label}. Return corrected JSON."
             )
     if not parts:  # defensive: called without a diagnosis
         parts.append(
@@ -339,6 +369,119 @@ def guard_equity_adjacent_buckets(result: dict, line_items: list) -> dict:
             f"value - it was an ordinary equity line (kept out of all buckets)."
         )
         result["liabilities"][bucket] = 0
+    return result
+
+
+# Placement guards: (label terms, "memo"|"bucket", target key). A printed
+# line whose label matches a term belongs in the target field, never folded
+# into other_assets.
+_PLACEMENT_GUARDS = (
+    (("goodwill", "intangible"), "memo", "goodwill_and_intangibles"),
+    (("property, plant", "property and equipment"), "bucket", "ppe"),
+)
+
+
+def enforce_asset_placements(result: dict, line_items: list) -> dict:
+    """Code guard (placement quality): printed goodwill/intangible lines
+    belong in memo.goodwill_and_intangibles and printed PP&E lines in ppe,
+    but a first pass that already balances never triggers the correction
+    loop, so the LLM can leave them folded into other_assets (CME/AAPL
+    regressions). When a target field falls short of its printed lines and
+    other_assets holds at least the difference, move the shortfall across —
+    all these fields count toward the assets tally, so the sums never
+    change."""
+    for terms, kind, key in _PLACEMENT_GUARDS:
+        expected = sum(
+            v for label, v in line_items
+            if isinstance(v, (int, float)) and v > 0
+            and any(t in label.lower() for t in terms)
+        )
+        if not expected:
+            continue
+        holder = (result.setdefault("memo", {}) if kind == "memo"
+                  else result["assets"]["non_current"])
+        target = f"{kind}.{key}" if kind == "memo" else key
+        current = holder.get(key, 0) or 0
+        shortfall = expected - current
+        if shortfall <= TALLY_TOLERANCE:
+            continue
+        other = result["assets"]["non_current"].get("other_assets", 0) or 0
+        if other + TALLY_TOLERANCE < shortfall:
+            result["warnings"].append(
+                f"{target} ({current:,}) is short of the printed matching "
+                f"lines ({expected:,}) but other_assets ({other:,}) does not "
+                f"hold the difference - placement left for review (no values "
+                f"moved)."
+            )
+            continue
+        shortfall = (int(shortfall) if shortfall == int(shortfall)
+                     else round(shortfall, 2))
+        result["assets"]["non_current"]["other_assets"] = other - shortfall
+        holder[key] = current + shortfall
+        result["warnings"].append(
+            f"Moved {shortfall:,} of printed lines out of other_assets into "
+            f"{target} (placement guard; totals unchanged)."
+        )
+    return result
+
+
+def _to_millions(value):
+    """Divide a thousands-scale value by 1,000 and round half-away-from-zero
+    to whole millions (user decision 2026-07-07)."""
+    scaled = value / 1000.0
+    return int(math.copysign(math.floor(abs(scaled) + 0.5), scaled))
+
+
+def convert_to_millions(result: dict) -> dict:
+    """Final normalization — the standard output scale is MILLIONS (user
+    decision 2026-07-07). Runs AFTER the tally verification, which always
+    ties the numbers at the filing's printed scale:
+      - "in thousands"  -> every value divided by 1,000 and rounded to whole
+        millions (so rounded buckets may differ from rounded totals by a few
+        units — the balanced flags keep the printed-scale verdict);
+      - "in millions"   -> values left exactly as printed (never re-rounded);
+      - anything else / missing -> values left at printed scale with a
+        warning (never guess a divisor).
+    unit_label is normalized to "in millions" whenever the scale is known."""
+    label = (result.get("unit_label") or "").lower()
+    if "million" in label:
+        result["unit_label"] = "in millions"
+        return result
+    if "thousand" not in label:
+        result.setdefault("warnings", []).append(
+            f"unit_label {result.get('unit_label')!r} is not recognized as "
+            f"thousands or millions - values left at the filing's printed scale."
+        )
+        return result
+
+    sections = [
+        ("assets", "non_current", ASSET_NON_CURRENT_KEYS),
+        ("assets", "current", ASSET_CURRENT_KEYS),
+        ("liabilities", "non_current", LIABILITY_NON_CURRENT_KEYS),
+        ("liabilities", "current", LIABILITY_CURRENT_KEYS),
+    ]
+    for group, sub, keys in sections:
+        block = result[group][sub]
+        for k in keys:
+            block[k] = _to_millions(block.get(k, 0) or 0)
+    for k in ("preferred_stock", "mezzanine_equity"):
+        result["liabilities"][k] = _to_millions(result["liabilities"].get(k, 0) or 0)
+    memo = result.setdefault("memo", {})
+    for k in MEMO_KEYS:
+        memo[k] = _to_millions(memo.get(k, 0) or 0)
+    for k in ("total_assets", "total_liabilities"):
+        result["filing_totals"][k] = _to_millions(result["filing_totals"].get(k, 0) or 0)
+    # Scale the sums for display consistency; the balanced booleans keep the
+    # verdict of the printed-scale verification and are NOT recomputed here.
+    for k in ("sum_assets", "sum_liabilities"):
+        result["tally"][k] = _to_millions(result["tally"].get(k, 0) or 0)
+
+    result["unit_label"] = "in millions"
+    result.setdefault("warnings", []).append(
+        "Converted from thousands to millions (rounded to whole millions; "
+        "the tally was verified at the filing's printed scale before "
+        "conversion)."
+    )
     return result
 
 

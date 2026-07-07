@@ -3,7 +3,11 @@
 Extracts a company's balance sheet from a 10-Q/10-K filing PDF and maps it into a
 **fixed Damodaran-style template** as JSON, with the standardized numbers
 **reconciled (tallied) against the filing's printed totals**. Built for equity-analyst
-use: numbers are copied exactly as printed — never scaled, converted, or rounded.
+use: extraction and the tally verification work on the numbers exactly as
+printed; a final code step then normalizes the output to the **standard scale
+of millions** (thousands-scale filings are divided by 1,000 and rounded to
+whole millions — user decision 2026-07-07; millions-scale filings pass through
+exactly as printed).
 
 - Package: [`Balance_sheet/`](Balance_sheet/)
 - One-call API (wired into the main backend): `POST /api/balance-sheet/standardize`
@@ -159,28 +163,33 @@ The user message the LLM receives contains, in order:
    values to bucket. This is the key reliability mechanism: the model
    classifies labels — it does not re-read the table, so wrong-column reads,
    hallucinated values, and subtotal mapping are structurally prevented.
-4. **MAPPING HINTS** for lines with no named bucket: cash/short-term
-   investments/prepaids → `other_current_assets`; goodwill/intangibles/deferred
-   tax assets → `other_assets`; right-of-use assets → `lease_assets`; debt
-   splits by the filing's classification — current portion of long-term debt /
-   notes payable / short-term borrowings → `current.debt`, long-term debt /
-   non-current borrowings → `non_current.other_liabilities` (the schema mirrors
-   the Excel template, which has no non-current debt row; never lumped into
-   `current.debt`); Land/Buildings/accumulated-depreciation blocks stay
-   **together in exactly one bucket** (`real_estate_assets` for REITs including
-   the negative depreciation, `ppe` otherwise); subtotal/total rows are never
-   mapped.
+4. **MAPPING HINTS** for lines with no named bucket: cash + short-term
+   investments / current marketable securities → `memo.cash_and_st_investments`
+   (prepaids/restricted cash stay in `other_current_assets`); goodwill and
+   intangible lines → `memo.goodwill_and_intangibles` (mixed "deferred taxes
+   and other assets" lines stay in `other_assets`); right-of-use assets →
+   `lease_assets`; debt splits by the filing's classification — current portion
+   of long-term debt / notes payable / short-term borrowings → `current.debt`,
+   long-term debt / non-current borrowings → `memo.long_term_debt` (never
+   lumped into `current.debt` or `other_liabilities`); income taxes payable →
+   `current.deferred_rev_and_tax`, accrued liabilities →
+   `other_current_liabilities`, combined "deferred income taxes and other
+   liabilities" lines → `non_current.other_liabilities` whole;
+   Land/Buildings/accumulated-depreciation blocks stay **together in exactly
+   one bucket** (`real_estate_assets` for REITs including the negative
+   depreciation, `ppe` otherwise); subtotal/total rows are never mapped.
 5. **The balance-sheet markdown** itself (for period/currency/unit context).
 
 The system prompt (fixed) carries the standardization rules: most-recent column
 only; numbers exactly as printed (strip only `$` and `,`); every line into
-exactly one bucket, leftovers into the closest `other_*`; current vs non-current
-by the filing's own sub-headers (judgement for unclassified REIT/bank sheets);
-interest-bearing debt split by the filing's current/non-current classification
-(`current.debt` vs `non_current.other_liabilities`); equity never mapped
-into liability buckets; and the **SINGLE-BUCKET RULE** — every source line
-contributes to exactly one bucket, `other_*` holds only lines not captured by a
-specific bucket, never a subtotal and its components, self-verify sums before
+exactly one bucket **or memo field**, leftovers into the closest `other_*`;
+current vs non-current by the filing's own sub-headers (judgement for
+unclassified REIT/bank sheets); interest-bearing debt split by the filing's
+current/non-current classification (`current.debt` vs `memo.long_term_debt`);
+equity never mapped into liability buckets; and the **SINGLE-BUCKET RULE** —
+every source line contributes to exactly one bucket or memo field, `other_*`
+holds only lines not captured by a specific bucket/memo field, never a subtotal
+and its components, self-verify (buckets + memo = printed totals) before
 returning.
 
 Output handling:
@@ -200,10 +209,12 @@ Output handling:
 2. **Printed-totals override** — Stage 1's code-read totals replace the LLM's
    `filing_totals` when available.
 3. **Exact sums** —
-   `sum_assets` = all asset buckets; `sum_liabilities` = non-current + current
-   liability buckets. `preferred_stock` / `mezzanine_equity` are captured but
-   sit **outside** the liabilities sum (they are outside the filing's printed
-   `Total liabilities`). Balanced = |sum − printed| ≤ `TALLY_TOLERANCE` (= 1).
+   `sum_assets` = all asset buckets + `memo.cash_and_st_investments` +
+   `memo.goodwill_and_intangibles`; `sum_liabilities` = non-current + current
+   liability buckets + `memo.long_term_debt`. `preferred_stock` /
+   `mezzanine_equity` are captured but sit **outside** the liabilities sum
+   (they are outside the filing's printed `Total liabilities`).
+   Balanced = |sum − printed| ≤ `TALLY_TOLERANCE` (= 1).
 4. **Gap diagnosis** (per unbalanced side), attached as `tally["diagnosis"]`
    (a list — both sides can fail):
 
@@ -253,17 +264,20 @@ Every balance-sheet line maps into exactly one of these buckets (keys are FIXED)
 | Liabilities — non-current | `pension`, `lease_liabilities`, `deferred_rev_and_tax`, `other_liabilities` |
 | Liabilities — current | `debt`, `lease_liabilities`, `accounts_trade_payable`, `deferred_rev_and_tax`, `other_current_liabilities` |
 | Equity-adjacent | `preferred_stock`, `mezzanine_equity` (filled only if explicitly shown; excluded from the liabilities tally) |
+| Memo (not buckets) | `cash_and_st_investments` (cash + short-term/current marketable securities), `goodwill_and_intangibles` (printed goodwill + intangible lines), `long_term_debt` (non-current interest-bearing debt). The Excel workbook's internal logic consumes these — they stay OUT of the buckets but count toward the tally (user decision 2026-07-05, matched to the analyst's manual sheet). |
 
 ### Output JSON shape
 
 ```json
 {
   "company": "", "period": "", "currency": "",
-  "unit_label": "",              // "thousands"/"millions" — labelling ONLY, never used to scale
+  "unit_label": "",              // normalized to "in millions" by the final scale step
   "source_pages": [],            // 1-based pages used (set by code)
   "assets":      { "non_current": { ... }, "current": { ... } },
   "liabilities": { "non_current": { ... }, "current": { ... },
                    "preferred_stock": 0, "mezzanine_equity": 0 },
+  "memo": { "cash_and_st_investments": 0, "goodwill_and_intangibles": 0,
+            "long_term_debt": 0 },   // workbook-consumed lines, kept out of buckets
   "filing_totals": { "total_assets": 0, "total_liabilities": 0 },   // printed values (code-read)
   "tally": {
     "sum_assets": 0, "sum_liabilities": 0,
@@ -278,8 +292,10 @@ Every balance-sheet line maps into exactly one of these buckets (keys are FIXED)
 
 ## 6. Hard rules (DO NOT)
 
-- Do **not** convert or scale units — numbers exactly as printed; only `$` and
-  `,` are ever stripped.
+- Do **not** convert or scale units during extraction or tally — numbers
+  exactly as printed; only `$` and `,` are ever stripped. (The ONLY scaling is
+  the final code step `tally.convert_to_millions`, which runs AFTER the tally
+  and converts thousands-scale filings to whole millions.)
 - Do **not** use anything but the most-recent period column.
 - Do **not** drop any balance-sheet line — everything maps into a bucket
   (leftovers into the closest `other_*`, once).
@@ -339,16 +355,18 @@ python -m Balance_sheet.test_sample path\to\a.pdf   # run one file
 
 Both pass live (exit code 0), including all bucket-level assertions.
 
-**Diversified Healthcare Trust 10-Q** (`test_data/dhc_10q.pdf`, $ thousands):
+**Diversified Healthcare Trust 10-Q** (`test_data/dhc_10q.pdf`, $ thousands —
+returned values converted to whole millions by the final scale step):
 
 | Check | Expected |
 |---|---|
-| `filing_totals.total_assets` | 4,267,552 |
-| `filing_totals.total_liabilities` | 2,647,133 |
-| both sides | balanced |
+| `filing_totals.total_assets` | 4,268 (printed 4,267,552 thousand) |
+| `filing_totals.total_liabilities` | 2,647 (printed 2,647,133 thousand) |
+| both sides | balanced (verified at printed scale) |
 
-Known trap: accrued interest (26,078) must land in `other_liabilities`, or
-liabilities sum to 2,621,055 and the tally fails.
+Known trap: accrued interest (printed 26,078) must land in
+`other_liabilities`, or liabilities sum to 2,621,055 at printed scale and the
+tally fails.
 
 **Apple 10-Q, March 28 2026** (`test_data/aapl_10q.pdf`, $ millions) — the
 double-counting regression case:
