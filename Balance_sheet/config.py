@@ -35,17 +35,19 @@ TITLE_VARIANTS = [
     "CONSOLIDATED STATEMENTS OF FINANCIAL POSITION",
 ]
 
-# Stage 4 — allowed rounding difference between summed buckets and printed totals.
-TALLY_TOLERANCE = 1
+# Stage 4 — rounding-aware tally tolerance. Filings round every printed line,
+# so summed lines rarely tie to the printed total exactly. Never require an
+# exact tie; never plug the difference.
+def tally_tolerance(mapped_lines: int, printed_total: float) -> float:
+    """Allowed |sum - printed total| gap: max(number of mapped lines,
+    0.1% of the printed total), floored at 1."""
+    return max(mapped_lines, abs(printed_total) * 0.001, 1)
+
 
 # Stage 4 — max LLM correction re-prompts when a side does not tally
-# (env-overridable; after these, the deterministic other_* plug reconciles).
+# (env-overridable; after these, the result is returned UNBALANCED with a
+# clear warning — a reconciling number is never fabricated).
 TALLY_MAX_RETRIES = int(os.getenv("BALANCE_SHEET_TALLY_RETRIES", "2"))
-
-# Stage 4 — a plug at or below this size is NOT rounding noise: a correct
-# mapping ties exactly, so a small residual gap means a line landed in the
-# wrong bucket. The plug still applies, but with a loud wrong-bucket warning.
-PLUG_SUSPICIOUS_GAP = int(os.getenv("BALANCE_SHEET_PLUG_SUSPICIOUS_GAP", "50"))
 
 # ---------------------------------------------------------------------------
 # Fixed target schema (Damodaran-style buckets). These keys are FIXED —
@@ -65,8 +67,8 @@ ASSET_CURRENT_KEYS = [
 ]
 
 # NOTE: the keys mirror the Excel template's rows EXACTLY — no extra fields.
-# There is deliberately no non-current debt bucket: long-term debt goes into
-# non_current.other_liabilities (user decision 2026-07-04, Excel template fixed).
+# There is deliberately no non-current debt bucket: long-term debt stays OUT
+# of the buckets, in memo_excluded.long_term_debt (memo-excluded design).
 LIABILITY_NON_CURRENT_KEYS = [
     "pension", "lease_liabilities", "deferred_rev_and_tax", "other_liabilities",
 ]
@@ -74,6 +76,15 @@ LIABILITY_NON_CURRENT_KEYS = [
 LIABILITY_CURRENT_KEYS = [
     "debt", "lease_liabilities", "accounts_trade_payable",
     "deferred_rev_and_tax", "other_current_liabilities",
+]
+
+# Memo-excluded categories — kept OUT of every bucket above, in a separate
+# memo_excluded object. Reconciliation (Stage 4):
+#   sum(asset buckets) + cash_and_marketable_securities + goodwill + intangibles
+#     == printed total_assets
+#   sum(liability buckets) + long_term_debt == printed total_liabilities
+MEMO_KEYS = [
+    "cash_and_marketable_securities", "goodwill", "intangibles", "long_term_debt",
 ]
 
 
@@ -95,6 +106,7 @@ def empty_result() -> dict:
             "preferred_stock": 0,
             "mezzanine_equity": 0,
         },
+        "memo_excluded": {k: 0 for k in MEMO_KEYS},
         "filing_totals": {"total_assets": 0, "total_liabilities": 0},
         "tally": {
             "sum_assets": 0, "sum_liabilities": 0,

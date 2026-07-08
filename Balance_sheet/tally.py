@@ -1,24 +1,35 @@
 """Stage 4 — tally check, done IN CODE (not by the LLM).
 
-Coerces every bucket value to a number (the only cleaning allowed is
-stripping "$" and ","), sums the buckets, compares against the filing's
-printed totals within TALLY_TOLERANCE, and sets the balanced booleans.
-Also builds the exact-gap message used for the one-shot LLM re-prompt.
+Coerces every bucket and memo value to a number (the only cleaning allowed
+is stripping "$" and ","), sums buckets + memo per side, compares against
+the filing's printed totals within the rounding-aware tolerance, and sets
+the balanced booleans. Reconciliation (memo-excluded design):
+  sum(asset buckets) + memo cash + goodwill + intangibles == printed total_assets
+  sum(liability buckets) + memo long_term_debt == printed total_liabilities
+Also builds the exact-gap message used for the LLM re-prompt loop. A number
+is NEVER fabricated to force a tie — an unreconciled side stays unbalanced,
+with a warning.
 """
 
+import itertools
 import logging
 import re
+from collections import Counter
 
 from .config import (
     ASSET_CURRENT_KEYS,
     ASSET_NON_CURRENT_KEYS,
     LIABILITY_CURRENT_KEYS,
     LIABILITY_NON_CURRENT_KEYS,
-    PLUG_SUSPICIOUS_GAP,
-    TALLY_TOLERANCE,
+    MEMO_KEYS,
+    tally_tolerance,
 )
 
 logger = logging.getLogger("balance_sheet.tally")
+
+# Memo fields counted on each side of the reconciliation.
+ASSET_MEMO_KEYS = [k for k in MEMO_KEYS if k != "long_term_debt"]
+LIABILITY_MEMO_KEYS = ["long_term_debt"]
 
 
 def coerce_number(value, warnings: list, label: str):
@@ -67,6 +78,9 @@ def coerce_result_numbers(result: dict) -> dict:
         result["liabilities"][k] = coerce_number(
             result["liabilities"].get(k), warnings, f"liabilities.{k}"
         )
+    memo = result.setdefault("memo_excluded", {})
+    for k in MEMO_KEYS:
+        memo[k] = coerce_number(memo.get(k), warnings, f"memo_excluded.{k}")
     for k in ("total_assets", "total_liabilities"):
         result["filing_totals"][k] = coerce_number(
             result["filing_totals"].get(k), warnings, f"filing_totals.{k}"
@@ -75,15 +89,23 @@ def coerce_result_numbers(result: dict) -> dict:
 
 
 def _sum_assets(result: dict) -> float:
+    # Buckets + the asset-side memo fields: the printed Total Assets includes
+    # cash/securities, goodwill and intangibles even though they are kept out
+    # of the standardized buckets.
     a = result["assets"]
-    return sum(a["non_current"].values()) + sum(a["current"].values())
+    memo = result.get("memo_excluded", {})
+    return (sum(a["non_current"].values()) + sum(a["current"].values())
+            + sum(memo.get(k, 0) for k in ASSET_MEMO_KEYS))
 
 
 def _sum_liabilities(result: dict) -> float:
     # preferred_stock / mezzanine_equity are equity-adjacent and sit OUTSIDE
     # the filing's printed "Total liabilities", so they are excluded here.
+    # Buckets + memo long_term_debt (excluded from buckets, in the printed total).
     li = result["liabilities"]
-    return sum(li["non_current"].values()) + sum(li["current"].values())
+    memo = result.get("memo_excluded", {})
+    return (sum(li["non_current"].values()) + sum(li["current"].values())
+            + sum(memo.get(k, 0) for k in LIABILITY_MEMO_KEYS))
 
 
 _OTHER_KEYS = {
@@ -97,6 +119,28 @@ def _side_buckets(result: dict, side: str):
     for sub in ("non_current", "current"):
         for key, value in result[side][sub].items():
             yield sub, key, value
+
+
+def _side_memo_items(result: dict, side: str):
+    """Yield (subsection, key, value) for the memo fields counted in the side's sum."""
+    memo = result.get("memo_excluded", {})
+    keys = ASSET_MEMO_KEYS if side == "assets" else LIABILITY_MEMO_KEYS
+    for key in keys:
+        yield "memo_excluded", key, memo.get(key, 0)
+
+
+def _side_entries(result: dict, side: str):
+    """Every entry (bucket + memo) counted in the side's sum."""
+    return itertools.chain(_side_buckets(result, side),
+                           _side_memo_items(result, side))
+
+
+def _side_tolerance(result: dict, side: str) -> float:
+    """Rounding-aware tolerance for one side: each mapped line is individually
+    rounded in the filing. The non-zero entry count (buckets + memo) stands in
+    for the number of mapped lines."""
+    mapped = sum(1 for _s, _k, v in _side_entries(result, side) if v)
+    return tally_tolerance(mapped, result["filing_totals"][f"total_{side}"])
 
 
 def _diagnose_side(result: dict, side: str) -> dict:
@@ -116,9 +160,9 @@ def _diagnose_side(result: dict, side: str) -> dict:
     if gap > 0:
         # ~= match: the duplicated line's printed value can differ slightly
         # from the gap (e.g. Apple: gap 50,016 vs ppe 50,116), so allow 1%.
-        tolerance = max(TALLY_TOLERANCE, round(abs(gap) * 0.01))
+        tolerance = max(1, round(abs(gap) * 0.01))
         best = None
-        for _sub, key, value in _side_buckets(result, side):
+        for _sub, key, value in _side_entries(result, side):
             if key in _OTHER_KEYS or not value:
                 continue
             distance = abs(value - gap)
@@ -131,8 +175,9 @@ def _diagnose_side(result: dict, side: str) -> dict:
 
 
 def run_tally(result: dict) -> dict:
-    """Sum the buckets, compare to the printed filing totals, set booleans.
-    Unbalanced sides get a structured diagnosis in tally["diagnosis"]."""
+    """Sum buckets + memo per side, compare to the printed filing totals
+    within the rounding-aware tolerance, set booleans. Unbalanced sides get
+    a structured diagnosis in tally["diagnosis"]."""
     sum_assets = _sum_assets(result)
     sum_liabilities = _sum_liabilities(result)
     totals = result["filing_totals"]
@@ -140,8 +185,10 @@ def run_tally(result: dict) -> dict:
     result["tally"] = {
         "sum_assets": sum_assets,
         "sum_liabilities": sum_liabilities,
-        "assets_balanced": abs(sum_assets - totals["total_assets"]) <= TALLY_TOLERANCE,
-        "liabilities_balanced": abs(sum_liabilities - totals["total_liabilities"]) <= TALLY_TOLERANCE,
+        "assets_balanced": abs(sum_assets - totals["total_assets"])
+                           <= _side_tolerance(result, "assets"),
+        "liabilities_balanced": abs(sum_liabilities - totals["total_liabilities"])
+                                <= _side_tolerance(result, "liabilities"),
     }
     diagnoses = []
     if not result["tally"]["assets_balanced"]:
@@ -164,16 +211,19 @@ def is_balanced(result: dict) -> bool:
 
 
 def _closest_bucket_to_gap(result: dict, side: str, gap: float):
-    """Find the bucket on this side whose value is closest to the gap
-    (any bucket, no distance cutoff — used for the over-count message)."""
+    """Find the bucket/memo entry on this side whose value is closest to the
+    gap, but only within 10% of it — naming a wildly-off bucket sends the
+    correction re-prompt chasing the wrong line."""
     best = None
-    for _sub, key, value in _side_buckets(result, side):
+    for _sub, key, value in _side_entries(result, side):
         if not value:
             continue
         distance = abs(value - gap)
         if best is None or distance < best[0]:
             best = (distance, key, value)
-    return best[1] if best else None
+    if best and best[0] <= max(1, abs(gap) * 0.10):
+        return best[1]
+    return None
 
 
 def build_gap_message(result: dict) -> str:
@@ -195,34 +245,50 @@ def build_gap_message(result: dict) -> str:
         sum_v = tally[f"sum_{side}"]
         printed = totals[f"total_{side}"]
         gap = diag["gap"]
+        memo_hint = (
+            "cash/marketable securities, goodwill or intangibles → the matching "
+            "memo_excluded field" if side == "assets"
+            else "long-term debt → memo_excluded.long_term_debt"
+        )
         if diag["type"] == "double_count":
             closest = (diag["likely_double_counted_bucket"]
                        or _closest_bucket_to_gap(result, side, gap))
             if closest:
                 parts.append(
-                    f"{label} over by {gap:,} (buckets sum to {sum_v:,} vs printed "
-                    f"{printed_label} {printed:,}). The value {gap:,} ~= bucket "
+                    f"{label} over by {gap:,} (buckets + memo sum to {sum_v:,} vs "
+                    f"printed {printed_label} {printed:,}). The value {gap:,} ~= "
                     f"'{closest}'. A line is counted in both '{closest}' and an "
                     f"other_* bucket — remove it from other_* so each line is "
                     f"counted once. Return corrected JSON."
                 )
             else:
+                memo_double_hint = (
+                    "a cash or marketable-securities line also sitting in "
+                    "other_current_assets (it belongs ONLY in memo_excluded."
+                    "cash_and_marketable_securities), or a goodwill/intangibles "
+                    "line also in other_assets" if side == "assets"
+                    else "a long-term debt line also sitting in other_liabilities "
+                    "or current.debt (it belongs ONLY in memo_excluded."
+                    "long_term_debt)"
+                )
                 parts.append(
-                    f"{label} over by {gap:,} (buckets sum to {sum_v:,} vs printed "
-                    f"{printed_label} {printed:,}). A line is counted in two "
-                    f"buckets or a subtotal row was mapped — re-map so each line "
-                    f"is counted exactly once. Return corrected JSON."
+                    f"{label} over by {gap:,} (buckets + memo sum to {sum_v:,} vs "
+                    f"printed {printed_label} {printed:,}). A printed line worth "
+                    f"about {gap:,} is counted in TWO places. Check FIRST for "
+                    f"{memo_double_hint}; otherwise a subtotal row was mapped or "
+                    f"a line sits in two buckets — re-map so each line is counted "
+                    f"exactly once. Return corrected JSON."
                 )
         else:
             parts.append(
-                f"{label} under by {abs(gap):,} (buckets sum to {sum_v:,} vs "
-                f"printed {printed_label} {printed:,}). A line summing to about "
-                f"{abs(gap):,} was not mapped. This is very often the custodial / "
-                f"performance-bond / collateral {'ASSET' if side == 'assets' else 'balance'} "
-                f"that matches a large amount you already mapped on the other "
-                f"side (e.g. other_current_liabilities). Add {abs(gap):,} to "
-                f"{other_hint} so {side} tie to printed {printed_label}. "
-                f"Return corrected JSON."
+                f"{label} under by {abs(gap):,} (buckets + memo sum to {sum_v:,} "
+                f"vs printed {printed_label} {printed:,}). A line summing to about "
+                f"{abs(gap):,} was not mapped. If the missing line is "
+                f"{memo_hint}; the custodial / performance-bond / collateral "
+                f"{'ASSET' if side == 'assets' else 'balance'} matching a large "
+                f"amount mapped on the other side, or other unmapped lines, go "
+                f"to {other_hint}. Map the missing printed line(s) so {side} tie "
+                f"to printed {printed_label}. Return corrected JSON."
             )
     if not parts:  # defensive: called without a diagnosis
         parts.append(
@@ -241,7 +307,7 @@ def add_unbalanced_warnings(result: dict) -> dict:
         side = diag["side"]
         gap = diag["gap"]
         text = (
-            f"{side.capitalize()} do not tally: buckets sum to "
+            f"{side.capitalize()} do not tally: buckets + memo sum to "
             f"{tally[f'sum_{side}']:,} vs printed total {side} "
             f"{totals[f'total_{side}']:,} (gap {gap:+,}). "
         )
@@ -258,58 +324,158 @@ def add_unbalanced_warnings(result: dict) -> dict:
             )
         else:
             text += (
-                f"Under by {abs(gap):,}; a line was not mapped - add the missing "
-                f"amount to the appropriate other_* bucket."
+                f"Under by {abs(gap):,}; a printed line was not mapped - the "
+                f"side is left UNBALANCED (no number is ever fabricated to "
+                f"force a tie); re-map the missing line."
             )
         result["warnings"].append(text)
     return result
 
 
-def apply_deterministic_plug(result: dict) -> dict:
-    """Last-resort reconcile AFTER the LLM retries: force each side's buckets
-    to sum to the printed total by adjusting ONLY an other_* bucket (never a
-    specific bucket), with a warning making the plug visible for review.
-    Guarantees the bucket sums always tie to the printed totals."""
-    for side, printed_label in (("assets", "Total Assets"),
-                                ("liabilities", "Total Liabilities")):
-        gap = result["tally"][f"sum_{side}"] - result["filing_totals"][f"total_{side}"]
-        if abs(gap) <= TALLY_TOLERANCE:
+_CURRENT_TAX_LABELS = {"taxes", "income taxes payable", "income tax payable"}
+
+_ITEM_TAG_RE = re.compile(r"^\[(ASSET|LIABILITY|EQUITY)\]\s*(.*)$")
+
+
+def _parse_item_label(label: str):
+    """Split an extract_line_items label into (side, core_label, cnc).
+    The tags exist only in the hint text — this reads them back for guards."""
+    side, core = "", label
+    m = _ITEM_TAG_RE.match(label)
+    if m:
+        side, core = m.group(1), m.group(2)
+    cnc = ""
+    for suffix, tag in ((" (current)", "current"), (" (non-current)", "non_current")):
+        if core.endswith(suffix):
+            core, cnc = core[: -len(suffix)], tag
+            break
+    return side, core.strip(), cnc
+
+
+def regroup_current_tax_liability(result: dict, line_items: list) -> dict:
+    """Deterministic split correction (House Convention 3): a CURRENT
+    liability line labeled "Taxes" / "Income taxes payable" belongs in
+    current.deferred_rev_and_tax, grouped with current deferred income — the
+    LLM keeps dropping it into other_current_liabilities instead. Move the
+    printed value ONLY when the bucket sums prove where it sits: the deferred
+    bucket currently equals the current tax/deferred lines WITHOUT the Taxes
+    line(s), and other_current_liabilities holds at least their value.
+    Both buckets are in liabilities.current, so the liabilities total and
+    the tally booleans are unchanged — only the split moves."""
+    cur = result["liabilities"]["current"]
+    taxes = []     # printed values of current-liability "Taxes"-type lines
+    tax_like = []  # values of every current-liability tax/deferred line
+    for label, value in line_items:
+        side, core, cnc = _parse_item_label(label)
+        if side != "LIABILITY" or cnc != "current" or not value:
             continue
-        if abs(gap) <= PLUG_SUSPICIOUS_GAP:
-            # A correct mapping ties exactly — a small residual is the
-            # signature of a wrong-bucket mis-map, not rounding.
-            result["warnings"].append(
-                f"LIKELY WRONG-BUCKET MAPPING ({side}): the remaining gap is "
-                f"only {abs(gap):,} — a correct mapping should tie exactly, "
-                f"so a small residual means a line was placed in the wrong "
-                f"bucket (not rounding). The plug is applied below, but the "
-                f"bucket breakdown needs review."
-            )
-        other_key = "other_assets" if side == "assets" else "other_liabilities"
-        if gap < 0:
-            # Buckets fall short — add the shortfall to the non-current other_* bucket.
-            shortfall = -gap
-            shortfall = int(shortfall) if shortfall == int(shortfall) else shortfall
-            result[side]["non_current"][other_key] += shortfall
-            result["warnings"].append(
-                f"Auto-plugged {shortfall:,} into {other_key} to reconcile to "
-                f"printed {printed_label}."
-            )
-        else:
-            # Buckets exceed printed — subtract the overage from the largest
-            # other_* bucket on this side.
-            overage = int(gap) if gap == int(gap) else gap
-            largest = None
-            for sub, key, value in _side_buckets(result, side):
-                if key in _OTHER_KEYS and (largest is None or value > largest[2]):
-                    largest = (sub, key, value)
-            sub, key, _value = largest
-            result[side][sub][key] -= overage
-            result["warnings"].append(
-                f"Auto-removed {overage:,} from {key} to reconcile to printed "
-                f"{printed_label} (buckets exceeded the printed total)."
-            )
-    return run_tally(result)
+        lowered = core.lower().rstrip(":").strip()
+        if lowered in _CURRENT_TAX_LABELS:
+            taxes.append(value)
+        if "tax" in lowered or "deferred" in lowered:
+            tax_like.append(value)
+    if not taxes:
+        return result
+    moved = sum(taxes)
+    without_taxes = sum(tax_like) - moved
+    if abs(cur["deferred_rev_and_tax"] - without_taxes) > 0.01:
+        return result  # already grouped there, or ambiguous — do not touch
+    if cur["other_current_liabilities"] < moved:
+        return result  # not sitting in other_* — nothing to move
+    cur["other_current_liabilities"] -= moved
+    cur["deferred_rev_and_tax"] += moved
+    result["warnings"].append(
+        f"Moved current tax liability {moved:,} from other_current_liabilities "
+        f"to current.deferred_rev_and_tax (grouped with current deferred "
+        f"income, House Convention 3). Same-side move - the liabilities total "
+        f"is unchanged."
+    )
+    return result
+
+
+def _side_raw_fields(raw: dict, side: str):
+    """Yield (field_name, raw_value) for every field counted in the side's
+    sum — the only places a duplicated chain term can distort the tally."""
+    for sub in ("non_current", "current"):
+        for key, value in raw[side][sub].items():
+            yield f"{side}.{sub}.{key}", value
+    memo = raw.get("memo_excluded", {})
+    keys = ASSET_MEMO_KEYS if side == "assets" else LIABILITY_MEMO_KEYS
+    for key in keys:
+        yield f"memo_excluded.{key}", memo.get(key, 0)
+
+
+_CHAIN_TERM_RE = re.compile(r"[+-]?\s*\d+(?:\.\d+)?")
+
+
+def _field_terms(value) -> list:
+    """Terms a RAW (pre-coercion) field value is built from: a ' + ' chain
+    string names each printed line value it uses; a plain number is one term."""
+    if isinstance(value, bool) or value is None:
+        return []
+    if isinstance(value, str):
+        cleaned = value.replace("$", "").replace(",", "")
+        return [float(t.replace(" ", "")) for t in _CHAIN_TERM_RE.findall(cleaned)]
+    if isinstance(value, (int, float)) and value:
+        return [float(value)]
+    return []
+
+
+def find_chain_duplicates(raw_result: dict, line_items: list) -> list:
+    """Single-count violations visible in the RAW LLM output: a printed
+    line's value appearing as a term in MORE chains (bucket/memo fields on
+    its side) than the filing prints it. Comparing against printed-value
+    multiplicities keeps two different lines that legitimately share a value
+    from being flagged, and custodial balances mapped once per side stay
+    legal. Detection only — code never picks which chain is the correct
+    home; that is the model's judgement in the correction loop."""
+    duplicates = []
+    for side, side_tag in (("assets", "ASSET"), ("liabilities", "LIABILITY")):
+        printed = Counter()
+        label_of = {}
+        for label, value in line_items:
+            tag, _core, _cnc = _parse_item_label(label)
+            if not value or tag == "EQUITY":
+                continue
+            if tag in (side_tag, ""):  # untagged lines count on both sides
+                v = float(value)
+                printed[v] += 1
+                label_of.setdefault(v, label)
+        used = {}
+        for name, value in _side_raw_fields(raw_result, side):
+            for term in _field_terms(value):
+                used.setdefault(term, []).append(name)
+        for v, fields in used.items():
+            if v in printed and len(fields) > printed[v]:
+                duplicates.append({
+                    "side": side,
+                    "value": int(v) if v == int(v) else v,
+                    "label": label_of[v],
+                    "fields": fields,
+                })
+    return duplicates
+
+
+def build_duplicate_message(duplicates: list) -> str:
+    """CORRECTION text for chain-level duplicates: names the duplicated line
+    and every chain using it, and instructs the model to keep it in exactly
+    one — the model, not code, decides which chain is the correct home."""
+    parts = []
+    for dup in duplicates:
+        counts = Counter(dup["fields"])
+        listing = " AND ".join(
+            name + (f" ({n} times)" if n > 1 else "")
+            for name, n in counts.items()
+        )
+        parts.append(
+            f"SINGLE-COUNT VIOLATION ({dup['side']}): the printed line "
+            f"'{dup['label']}' = {dup['value']:,} appears as a term in more "
+            f"than one place: {listing}. Keep {dup['value']:,} in exactly "
+            f"ONE of them (whichever the mapping rules say) and REMOVE it "
+            f"from the other chain(s), leaving every other term unchanged. "
+            f"Return corrected JSON."
+        )
+    return " ".join(parts)
 
 
 _EQUITY_ADJACENT_TERMS = {

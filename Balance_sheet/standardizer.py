@@ -20,155 +20,123 @@ from .config import LLM_BASE_URL, LLM_MODEL, empty_result, require_together_key
 
 logger = logging.getLogger("balance_sheet.standardizer")
 
-SYSTEM_PROMPT = """You are a financial-statement standardizer. You are given the markdown of ONE company's
-balance sheet. Map every line item into the FIXED schema provided. Return ONLY a JSON object
-matching the schema — no explanation, no markdown fences.
+SYSTEM_PROMPT = """Balance-Sheet Standardizer — Goal Loop (run until totals tally)
 
-RULES:
-- Use ONLY the most recent period column (the left/most-recent date). Ignore prior-period
-  columns entirely.
-- Copy numbers EXACTLY as printed. Do NOT convert units, scale, or round. Strip only the
-  currency symbol and thousands separators (commas). Negative numbers stay negative.
-- Map EVERY asset line into exactly one asset bucket, and EVERY liability line into exactly
-  one liability bucket. Do not drop any line. If a line has no obvious bucket, put it in the
-  closest 'other_*' bucket (other_assets / other_current_assets / other_liabilities /
-  other_current_liabilities) so the totals still reconcile.
-- Distinguish current vs non-current using the filing's own sub-headers when present. If the
-  filing is unclassified (common for REITs/banks), use judgement: cash, receivables,
-  inventory, short-term items -> current; property, long-term investments, intangibles ->
-  non-current.
-- DEBT SPLIT: map interest-bearing debt by the filing's current/non-current classification.
-  - Current portion of long-term debt, notes payable, short-term borrowings, commercial paper,
-    current debt -> current.debt.
-  - Long-term debt / non-current borrowings -> non_current.other_liabilities (the schema has no
-    non-current debt bucket - group long-term debt there).
-  Never lump long-term debt into current.debt.
-  (If the filing is unclassified, use judgement: revolvers/commercial paper/current maturities
-  -> current.debt; term debt, notes and bonds -> non_current.other_liabilities.)
-- Deferred income tax liabilities -> deferred_rev_and_tax (current or non-current per the filing).
-  When a filing combines "Deferred income taxes and other liabilities" on one line, map the whole
-  line to the non-current bucket that matches its dominant nature (deferred_rev_and_tax if it is
-  primarily deferred tax; otherwise other_liabilities) - but map it to exactly ONE bucket, do not
-  split unless the filing itself splits it. Do not double-count accrued liabilities and income
-  taxes payable - each line goes to exactly one current bucket (accrued -> other_current_liabilities,
-  income taxes payable -> other_current_liabilities or deferred_rev_and_tax per filing).
-- ACCRUED INTEREST and any miscellaneous payables must be mapped (usually other_liabilities /
-  other_current_liabilities) — never omitted, or liabilities will under-count.
-- Equity is NOT part of the buckets. Do not map equity lines into liability buckets.
-  (preferred_stock and mezzanine_equity are the only equity-adjacent buckets — fill them only
-  if the filing explicitly shows preferred stock or mezzanine/temporary equity.)
-  Common stock at stated/par value, capital in excess of stated/par value, additional paid-in
-  capital, retained earnings, treasury stock and accumulated other comprehensive income are
-  ordinary EQUITY — NEVER map them into preferred_stock or mezzanine_equity (or any bucket).
-  mezzanine_equity is ONLY for temporary equity shown outside permanent equity (e.g. redeemable
-  preferred stock, redeemable noncontrolling interests); if that line prints a dash/zero, leave
-  the bucket 0.
-- NEVER invent a number. Every bucket value must be a printed line value (or a ' + ' chain of
-  printed line values) from the most-recent column. If the buckets do not sum to the printed
-  total, the fix is ALWAYS re-mapping printed lines — never inserting a balancing figure.
-- filing_totals.total_assets = the filing's PRINTED "Total assets" (most recent column).
-  filing_totals.total_liabilities = the filing's PRINTED "Total liabilities" line. If no
-  explicit "Total liabilities" line exists, compute it as printed Total liabilities & equity
-  minus total equity, and note this in reasoning is NOT allowed — instead put the value you
-  derive and add a note is also NOT allowed; if there is genuinely no total-liabilities line,
-  set it to the sum of all liability lines you mapped.
-- unit_label: copy the scale wording from the filing header ("in thousands"/"in millions")
-  for labelling only. Never use it to scale the numbers.
+You are a financial-statement standardizer working like a professional equity analyst.
+You are given the markdown of ONE company's balance sheet AND a code-extracted LINE ITEMS
+list. Map every line item into the FIXED schema below. Return ONLY a JSON object matching
+the schema — no explanation, no markdown fences.
 
-SINGLE-BUCKET RULE (critical):
-- Every source line contributes to EXACTLY ONE bucket.
-- If a line is placed in a specific bucket (ppe, investment_assets, real_estate_assets,
-  inventory, accounts_trade_receivable, debt, accounts_trade_payable, deferred_rev_and_tax,
-  etc.), it MUST NOT also be included in any other_* bucket.
-- other_* buckets (other_assets, other_current_assets, other_liabilities,
-  other_current_liabilities) contain ONLY the lines not already captured by a specific bucket.
-- Never take a subtotal AND its components. Map the individual line items, never a section
-  subtotal (e.g. do not map "Total non-current assets" — map the lines under it).
-- Self-verify before returning: sum of ALL asset buckets must equal printed Total Assets, and
-  sum of ALL liability buckets must equal printed Total Liabilities. If they do not, you have
-  either double-counted (same line in two buckets) or missed a line — fix it before returning.
+## USE THE EXTRACTED LINE-ITEM LIST ONLY (critical — prevents double-counting)
+You will be given a LINE ITEMS list extracted in code from the most-recent column, with all
+subtotal/total rows already removed. Map ONLY the lines in that list. Do NOT re-read numbers
+from the markdown table, and NEVER map a "Total ..." or subtotal row (e.g. "Total inventory",
+"Total current assets"). Each listed line is counted exactly once. If the list is present,
+it is the single source of truth for both labels and values.
 
-OFFSETTING / CUSTODIAL BALANCES (critical for banks, brokers, exchanges, clearing houses):
-Performance-bond, guaranty-fund, margin deposits, segregated customer funds, and other
-custodial balances appear on BOTH sides of the balance sheet in near-equal amounts — the
-entity holds cash/securities as an ASSET and owes them back as a LIABILITY. If you map such a
-balance as a liability (e.g. into other_current_liabilities), you MUST also map its
-corresponding asset (the cash and securities held as that collateral) into an asset bucket
-(other_current_assets or other_assets). NEVER map one side without the other.
-After mapping, the sum of all asset buckets MUST equal printed Total Assets and the sum of all
-liability buckets MUST equal printed Total Liabilities. If assets fall short by roughly the
-size of a large custodial liability you mapped, you omitted the matching custodial asset — add
-it.
+## HOW TO READ THE SCHEMA FIELD NAMES
+The bucket names are canonical labels. Filings will almost never use these exact words — match
+each line to the correct bucket BY MEANING (analyst judgement), not string matching. Examples:
+- "Property, plant and equipment — net" → ppe
+- "Operating right-of-use assets — net" → lease_assets
+- "Notes and accounts receivable — trade" → accounts_trade_receivable
+- "Prepaid pension assets" → pension_assets
+- "Retirement and nonpension postretirement benefit obligations" → pension (liability)
 
-BUCKET PLACEMENT RULES (map into the CORRECT bucket, not just any bucket that makes the total
-tie):
+## GOAL / FINISH CONDITION (loop until ALL are true)
+1. sum(all asset buckets) + memo.cash_and_marketable_securities + memo.goodwill + memo.intangibles
+   == printed "Total assets" (most-recent column), within filing rounding.
+2. sum(all liability buckets) + memo.long_term_debt == printed "Total liabilities", within rounding.
+3. Every listed line is counted EXACTLY ONCE (one bucket OR one memo field) — none dropped, none double-counted.
+4. unit_label identified from the filing header.
 
-1. RESPECT THE FILING'S CURRENT vs NON-CURRENT HEADERS. If the balance sheet has "Current
-   Assets" / "Current Liabilities" sections (most GAAP filings do), every line under those
-   headers MUST go into a CURRENT bucket, and everything else into a NON-CURRENT bucket. Never
-   put a line the filing lists as current into a non-current bucket or vice-versa.
+ROUNDING TOLERANCE: filings round each line, so lines rarely sum to the printed total exactly.
+Accept a small gap (≈ number of lines, or ±0.1%) as rounding. Do NOT chase a rounding-size gap,
+and NEVER insert a plug/balancing figure. Re-map only when the gap is materially larger than rounding.
 
-2. CASH & MARKETABLE SECURITIES: there is no dedicated cash bucket. Map cash, cash
-   equivalents, and current marketable/short-term securities into other_current_assets. Map
-   NON-current/long-term investments into investment_assets (or other_assets if it's a mixed
-   'other' line).
+## FIXED SCHEMA — standardized balance sheet
+### assets.non_current
+- lease_assets, real_estate_assets, investment_assets, investment_in_other,
+  assets_held_for_sale, asset_from_discontinued_business, pension_assets, other_assets, ppe
+### assets.current
+- lease_assets, inventory, accounts_trade_receivable, tax, other_current_assets
+### liabilities.non_current
+- pension, lease_liabilities, deferred_rev_and_tax, other_liabilities
+### liabilities.current
+- debt, lease_liabilities, accounts_trade_payable, deferred_rev_and_tax, other_current_liabilities
 
-3. PP&E vs REAL ESTATE:
-   - "Property, plant and equipment", "Property and equipment, net", "Property, net of
-     depreciation" -> ppe.
-   - real_estate_assets is ONLY for entities whose business is holding real estate (REITs:
-     "Real estate properties", "Buildings and improvements", "Land"). Do NOT put ordinary
-     operating PP&E into real_estate_assets.
+## MEMO — EXCLUDED FROM THE BALANCE SHEET (separate `memo_excluded` object)
+Keep these OUT of every bucket above; they exist only so the totals reconcile:
+- cash_and_marketable_securities = cash + cash equivalents + current marketable/short-term
+  securities. Restricted cash does NOT go here → other_current_assets.
+- goodwill = goodwill only.
+- intangibles = intangible assets (net), excluding goodwill.
+- long_term_debt = non-current interest-bearing debt. Current portion of debt → current.debt.
 
-4. INTANGIBLES & GOODWILL: there is no separate intangibles/goodwill bucket. Map intangible
-   assets and goodwill into other_assets (non-current). Group them there — do not scatter into
-   unrelated buckets.
+## HOUSE CONVENTIONS (firm-specific — follow exactly; these override generic instinct)
+1. INVESTMENT_ASSETS is narrow. Use investment_assets ONLY for holdings explicitly labeled
+   as marketable securities / equity or debt investments held long-term. Do NOT put financing
+   or lending receivables there. Specifically:
+   - "Long-term financing receivables" → other_assets (NOT investment_assets).
+   - "Investments and sundry assets" and any mixed "... and sundry/other assets" line → other_assets.
+   - Equity-method stakes in associates / "investment in <named company>" → investment_in_other.
+2. NON-CURRENT other_assets is the catch-all for: long-term financing receivables, non-current
+   deferred costs, deferred tax ASSETS, and any other non-current line without a specific bucket.
+   (Goodwill and intangibles are NOT here — they go to memo.)
+3. TAX LINES:
+   - A CURRENT liability line named "Taxes" / "Income taxes payable" → deferred_rev_and_tax (current),
+     grouped with current "Deferred income". NOT other_current_liabilities.
+   - A CURRENT asset "income taxes receivable" → tax (current asset bucket).
+   - Non-current deferred income / deferred income taxes (liability) → deferred_rev_and_tax (non-current).
 
-5. CUSTODIAL / PERFORMANCE-BOND / CLEARING BALANCES: map to the side AND the current/non-
-   current level the filing shows. E.g. "Performance bonds and guaranty fund contributions"
-   listed under Current Assets -> other_current_assets; the matching one under Current
-   Liabilities -> other_current_liabilities. (Both sides must be mapped — see offsetting rule.)
+## CORE RULES
+- Use ONLY the most-recent period column. Copy numbers exactly (strip only "$" and commas);
+  negatives stay negative. Never invent a number — every value is a printed line value, or a
+  " + " chain of printed line values when several lines share one bucket.
+- Equity is NOT mapped anywhere (common stock, paid-in capital, retained earnings, treasury
+  stock, AOCI, noncontrolling interests) — leave it out entirely.
 
-6. DEBT SPLIT: map interest-bearing debt by the filing's current/non-current classification —
-   current portion of long-term debt, notes payable, short-term borrowings, commercial paper
-   -> current.debt ; long-term debt / non-current borrowings -> non_current.other_liabilities
-   (no non-current debt bucket exists). Never lump long-term debt into current.debt.
+## CURRENT vs NON-CURRENT
+Respect the filing's own "Current" section headers — lines under them → a current bucket (or
+the cash memo); everything else → non_current. If unclassified (REITs/banks), use judgement:
+cash/receivables/inventory/short-term → current; property/long-term investments/intangibles → non-current.
 
-7. other_* buckets are a LAST RESORT for lines with no specific bucket — not a dumping ground.
-   Only use them for genuinely miscellaneous items (and intangibles/goodwill per rule 4, and
-   custodial balances per rule 5). Never move a line that has a correct specific bucket (ppe,
-   accounts_trade_receivable, inventory, debt, etc.) into an other_* bucket.
+## BUCKET PLACEMENT (match by meaning)
+- Operating PP&E (net) → ppe. Real estate that IS the business (REITs) → real_estate_assets.
+- Right-of-use lease assets → lease_assets (current if the filing lists it current).
+- Trade receivables, notes receivable, current financing receivables held for investment,
+  other trade-type receivables → accounts_trade_receivable. Inventory → inventory.
+- Deferred costs (current), prepaid expenses, restricted cash, held-for-sale current items,
+  other misc current assets → other_current_assets.
+- current portion of long-term debt / short-term borrowings / notes payable / commercial paper
+  → current.debt ; long-term debt → memo.long_term_debt (never lumped into current.debt).
+- Trade payables → accounts_trade_payable. Accrued expenses, compensation & benefits, accrued
+  interest, misc payables → other_current_liabilities. (Current "Taxes" → deferred_rev_and_tax, per House Convention 3.)
+- Non-current: pension/retirement obligations → pension ; non-current lease liabilities →
+  lease_liabilities ; everything else non-current misc → other_liabilities.
 
-After mapping: verify (a) every current-section line is in a current bucket and every
-non-current line in a non-current bucket, AND (b) the bucket sums equal printed Total Assets
-and Total Liabilities.
+## SINGLE-COUNT RULE
+Every listed line contributes to exactly one place. Never map a subtotal AND its components
+(e.g. never map "Total inventory" when "Finished goods" and "Work in process" are already
+mapped). If a line is in a specific bucket it must not also sit in an other_* bucket or a memo field.
 
-WORKED EXAMPLES (correct placement):
+## OFFSETTING / CUSTODIAL BALANCES (banks, brokers, exchanges, clearing houses)
+Performance-bond / guaranty-fund / margin / segregated customer balances appear on BOTH sides
+in near-equal amounts. If you map such a balance as a liability, also map the matching asset.
 
-Example A — CME (exchange/clearing house), assets:
-  Filing "Current Assets": Cash 2,391.2, Marketable securities 124.2, AR 935.5, Other current
-  515.0, Performance bonds 165,035.3.
-  -> other_current_assets = 2,391.2 + 124.2 + 515.0 + 165,035.3 = 168,065.7 ;
-     accounts_trade_receivable = 935.5
-  Filing non-current: Property net 355.4 -> ppe ; Intangibles 17,175.3 + 2,550.8 + Goodwill
-  10,506.0 + Other 2,404.5 -> other_assets = 32,636.6
-  Ties to printed 201,993.5. NOTE cash/securities/performance-bonds are CURRENT (not
-  other_assets), and 355.4 is ppe (not real_estate_assets).
+## VERIFICATION (every pass, before returning)
+1. Every current-section line is in a current bucket or the cash memo; non-current lines are not.
+2. sum(asset buckets) + cash + goodwill + intangibles == printed Total Assets (within rounding).
+3. sum(liability buckets) + long_term_debt == printed Total Liabilities (within rounding).
+4. No line double-counted; none dropped; no equity mapped; no plug inserted.
+5. House Conventions 1–3 obeyed (investment_assets narrow; sundry/financing receivables in
+   other_assets; current "Taxes" in deferred_rev_and_tax).
 
-Example B — REIT (e.g. Diversified Healthcare Trust):
-  "Real estate properties, net" -> real_estate_assets (this IS the business). Property lines
-  here are real_estate_assets, NOT ppe. (Contrast with Example A.)
-
-Example C — Apple (classified GAAP):
-  Current: Cash + current marketable securities + other current -> other_current_assets ;
-  AR + vendor receivables -> accounts_trade_receivable ; Inventory -> inventory.
-  Non-current: PP&E net -> ppe ; non-current marketable securities -> investment_assets ;
-  Intangibles + other non-current -> other_assets.
-
-If you are given a CORRECTION note describing an over- or under-count, fix ONLY the indicated
-issue: move the offending amount out of / into the correct other_* bucket so every line is
-counted exactly once and the bucket sums equal the printed Total Assets and Total Liabilities.
-Return the full corrected JSON, same schema, numbers as printed.
+## DECISION
+- All checks pass → return the full JSON.
+- Gap > rounding → you double-counted or missed a line: re-map and re-verify.
+- Given a CORRECTION note → fix ONLY the indicated issue, copy every other bucket unchanged,
+  numbers as printed. Return the full corrected JSON.
 
 Return the JSON now.
 """
@@ -180,30 +148,84 @@ _CELL_NUM_RE = re.compile(r"-?\d{1,3}(?:,\d{3})*(?:\.\d+)?")
 _DASH_CELLS = {"—", "–", "-", "--"}
 
 
+# Section keywords for tagging line items with the side they sit under.
+# Order matters: "LIABILITIES AND EQUITY" headers must tag as LIABILITY.
+_SECTION_TERMS = (("liabilit", "LIABILITY"), ("equity", "EQUITY"), ("asset", "ASSET"))
+
+
+def _update_section(text: str, section: str, cnc: str) -> tuple[str, str]:
+    """Advance the (side, current/non-current) state from a header line.
+    Loose, case-insensitive substring matching. A side change resets the
+    current/non-current state so a stale tag never leaks across statements;
+    when no header decides it, cnc stays "" (unknown) — never force a tag."""
+    lowered = text.lower()
+    new_section = section
+    for term, tag in _SECTION_TERMS:
+        if term in lowered:
+            new_section = tag
+            break
+    if new_section != section:
+        cnc = ""
+    # "non-current ..." headers contain "current asset(s)"/"current liabilit..."
+    # as substrings, so the non-current check must run first.
+    if "non-current" in lowered or "noncurrent" in lowered or "non current" in lowered:
+        cnc = "non_current"
+    elif "current asset" in lowered or "current liabilit" in lowered:
+        cnc = "current"
+    return new_section, cnc
+
+
 def extract_line_items(markdown: str) -> list[tuple[str, float]]:
     """Pull (label, most-recent-column value) pairs from the markdown table
     IN CODE, skipping subtotal/total rows. Giving the LLM this checklist
     means it only classifies labels into buckets — it never re-reads the
     table, so it cannot hallucinate values, use the prior-period column, or
-    map a subtotal row."""
+    map a subtotal row. Labels carry the filing section they sit under: the
+    side ([ASSET] / [LIABILITY] / [EQUITY]) plus a (current)/(non-current)
+    tag read from the filing's own section headers — so a line cannot be
+    mapped onto the wrong side, and identically-named lines in different
+    sections (IBM prints "Deferred costs" both current and non-current) stay
+    separate lines counted once each. Tags appear ONLY in this hint text,
+    never in the output JSON. When no current/non-current header exists
+    (unclassified REIT/bank sheets) the tag is omitted and the LLM falls
+    back to its own current-vs-non-current judgement rule."""
     items = []
+    section = ""
+    cnc = ""  # "current" / "non_current" / "" (unknown)
     for line in markdown.splitlines():
         stripped = line.strip()
         if not stripped.startswith("|"):
+            heading = stripped.lstrip("#").strip()
+            if heading:
+                section, cnc = _update_section(heading, section, cnc)
             continue
         cells = [c.strip() for c in stripped.strip("|").split("|")]
         if len(cells) < 2:
             continue
         label = cells[0].strip("* ").strip()
-        if not label or label.lower().startswith("total"):
-            continue  # header/subtotal/total rows never map into buckets
+        if not label:
+            continue
+        if label.lower().startswith("total"):
+            # Subtotal/total rows never map into buckets, but they advance
+            # the section state: past "Total current assets"/"Total current
+            # liabilities", everything until the next statement is non-current.
+            lowered = label.lower()
+            if lowered.startswith("total current"):
+                cnc = "non_current"
+            elif lowered.startswith(("total assets", "total liabilities",
+                                     "total equity")):
+                cnc = ""
+            continue
+        display = f"[{section}] {label}" if section else label
+        if cnc and section != "EQUITY":
+            display += " (current)" if cnc == "current" else " (non-current)"
         for cell in cells[1:]:
             raw = cell.strip("* ").replace("$", "").strip()
             if raw in _DASH_CELLS:
                 # Most-recent column prints a dash = zero. Stop here — falling
                 # through would read the PRIOR-period column (e.g. NIKE
                 # "Notes payable | — | 5" must be 0, not 5).
-                items.append((label, 0))
+                items.append((display, 0))
                 break
             negative = raw.startswith("(") and raw.endswith(")")
             raw = raw.strip("()").strip()
@@ -212,8 +234,12 @@ def extract_line_items(markdown: str) -> list[tuple[str, float]]:
                 value = float(raw.replace(",", ""))
                 if negative:
                     value = -value
-                items.append((label, int(value) if value == int(value) else value))
+                items.append((display, int(value) if value == int(value) else value))
                 break  # first numeric/dash cell = most-recent column
+        else:
+            # Value-less table row = an in-table section header
+            # ("Liabilities:", "Current assets:", "Equity:").
+            section, cnc = _update_section(label, section, cnc)
     return items
 
 
@@ -226,9 +252,18 @@ def _build_user_message(markdown: str) -> str:
         items_block = (
             "LINE ITEMS (extracted in code from the most-recent column; "
             "subtotal/total rows already removed). Bucket EVERY asset and "
-            "liability line below into exactly one bucket using these EXACT "
-            "values — do not re-read them from the markdown. Equity lines "
-            "stay out of the buckets:\n"
+            "liability line below into exactly one bucket or memo field "
+            "using these EXACT values — do not re-read them from the "
+            "markdown. The [ASSET]/[LIABILITY]/[EQUITY] tag is the filing "
+            "section the line sits in: [ASSET] lines go ONLY into asset "
+            "buckets/memo fields, [LIABILITY] lines ONLY into liability "
+            "buckets/memo (never into an asset bucket like tax), and "
+            "[EQUITY] lines stay out of the buckets entirely. Each line is "
+            "also tagged (current) or (non-current) — map it into the "
+            "matching current vs non-current bucket, and treat two "
+            "identically-named lines with different tags as SEPARATE lines "
+            "counted once each. A line with neither tag: use your own "
+            "current-vs-non-current judgement rule:\n"
             f"{listing}\n\n"
         )
     return (
@@ -236,28 +271,36 @@ def _build_user_message(markdown: str) -> str:
         "do not invent new keys):\n"
         f"{schema}\n\n"
         "NUMBERS: no digit-group commas inside a number. When several "
-        "balance-sheet lines map into the same bucket, do NOT add them "
-        "yourself — write the printed values joined by ' + ' (e.g. "
-        '"other_assets": 100 + 200 + 300) and the caller will compute the '
-        "exact sum. Never any other arithmetic. Every number you write must "
+        "balance-sheet lines map into the same bucket (or memo field), do "
+        "NOT add them yourself — write the printed values joined by ' + ' "
+        'as a JSON STRING (e.g. "other_assets": "100 + 200 + 300") and the '
+        "caller will compute the exact sum. Never any other arithmetic. "
+        "Every number you write must "
         "be copied character-for-character from the most-recent column of "
         "the markdown — never write a number that does not appear there, and "
         "never repeat a line's value in a second bucket.\n\n"
         f"{items_block}"
         "MAPPING HINTS for lines with no named bucket (they must NEVER be "
         "dropped, or the totals will not reconcile):\n"
-        "- Cash and cash equivalents, short-term investments, prepaid "
-        "expenses, current derivative/receivable odds and ends -> "
-        "current.other_current_assets.\n"
-        "- Goodwill, intangible assets, non-current derivatives, deferred "
-        "tax assets -> non_current.other_assets.\n"
+        "- Cash and cash equivalents + current marketable/short-term "
+        "securities -> memo_excluded.cash_and_marketable_securities (NOT "
+        "other_current_assets). Restricted cash, prepaid expenses, current "
+        "derivative/receivable odds and ends -> current.other_current_assets.\n"
+        "- Goodwill -> memo_excluded.goodwill ; intangible assets (net, "
+        "excluding goodwill) -> memo_excluded.intangibles (NEVER into "
+        "other_assets). Non-current derivatives, deferred tax assets -> "
+        "non_current.other_assets.\n"
         "- Right-of-use assets -> lease_assets (non_current unless the "
         "filing shows a current portion).\n"
         "- Interest-bearing debt splits by the filing's classification: "
         "current portion of long-term debt / notes payable / short-term "
         "borrowings -> current.debt ; long-term debt / non-current "
-        "borrowings -> non_current.other_liabilities (never lumped into "
-        "current.debt).\n"
+        "borrowings -> memo_excluded.long_term_debt (NEVER into "
+        "current.debt or other_liabilities).\n"
+        "- Reconciliation to hit: sum(asset buckets) + memo cash + goodwill "
+        "+ intangibles == printed total assets ; sum(liability buckets) + "
+        "memo long_term_debt == printed total liabilities (within filing "
+        "rounding).\n"
         "- Real estate blocks (Land / Buildings and improvements / less "
         "Accumulated depreciation) belong TOGETHER in exactly ONE bucket: "
         "real_estate_assets for REITs/property companies (include the "
@@ -278,8 +321,19 @@ def _call_llm(messages: list[dict]) -> str:
         messages=messages,
         temperature=0,
         max_tokens=4096,
+        # JSON output mode + the provider's disable-reasoning switch:
+        # thinking-by-default models (GLM, DeepSeek, Qwen3) otherwise burn the
+        # budget on reasoning tokens and leave .content empty.
+        response_format={"type": "json_object"},
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
-    return response.choices[0].message.content or ""
+    message = response.choices[0].message
+    content = message.content or ""
+    if not content:
+        # Some reasoning models still return the reply in the reasoning field.
+        content = (getattr(message, "reasoning_content", None)
+                   or getattr(message, "reasoning", None) or "")
+    return content
 
 
 def _strip_fences(text: str) -> str:
@@ -343,6 +397,15 @@ def _validate(result: dict) -> None:
     for k in ("preferred_stock", "mezzanine_equity"):
         if k not in result["liabilities"]:
             raise ValueError(f"Missing key: liabilities.{k}")
+    memo = result.get("memo_excluded")
+    if not isinstance(memo, dict):
+        raise ValueError("Missing or invalid section: memo_excluded")
+    for k in config.MEMO_KEYS:
+        if k not in memo:
+            raise ValueError(f"Missing memo key: memo_excluded.{k}")
+    extra = set(memo) - set(config.MEMO_KEYS)
+    if extra:
+        raise ValueError(f"Invented keys in memo_excluded: {sorted(extra)}")
     for k in ("total_assets", "total_liabilities"):
         if k not in result.get("filing_totals", {}):
             raise ValueError(f"Missing key: filing_totals.{k}")
@@ -408,8 +471,9 @@ def restandardize(markdown: str, previous_json: dict, gap_message: str) -> dict:
                 "possible edit: change ONLY the bucket(s) implicated by the "
                 "gap(s) above and copy every other bucket value UNCHANGED "
                 "from the previous JSON. When a bucket holds several lines, "
-                "rewrite it as the printed values joined by ' + ' (e.g. 100 + "
-                "200), copying each number character-for-character from the "
+                "rewrite it as the printed values joined by ' + ' as a JSON "
+                'STRING (e.g. "100 + 200"), copying each number character-'
+                "for-character from the "
                 "most-recent column of the markdown — never a value already "
                 "placed in another bucket, never a subtotal row, never a "
                 "number that is not printed there. Numbers exactly as printed "

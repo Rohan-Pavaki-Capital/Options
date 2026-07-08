@@ -19,6 +19,10 @@ from .config import TITLE_VARIANTS
 logger = logging.getLogger("balance_sheet.pdf_locator")
 
 _TOTAL_ASSETS_MARKER = "total assets"
+# Some filers (e.g. Conagra) leave the assets-total row unlabeled — only the
+# bare number is printed. The "Total current assets" subtotal still confirms
+# the assets side of the statement was captured.
+_ASSETS_SIDE_FALLBACK_MARKER = "total current assets"
 # Any of these confirms the liabilities/equity side of the statement was captured.
 _EQUITY_TOTAL_MARKERS = [
     "total liabilities and shareholders",
@@ -26,6 +30,9 @@ _EQUITY_TOTAL_MARKERS = [
     "total liabilities and equity",
     "total liabilities, redeemable",
     "total equity",
+    # Unlabeled L&E-total filers (e.g. Conagra) still print the equity total.
+    "total stockholders",
+    "total shareholders",
 ]
 
 
@@ -35,6 +42,11 @@ def _page_text(doc: "fitz.Document", index: int) -> str:
 
 def _has_equity_total(text: str) -> bool:
     return any(marker in text for marker in _EQUITY_TOTAL_MARKERS)
+
+
+def _has_assets_total(text: str) -> bool:
+    return (_TOTAL_ASSETS_MARKER in text
+            or _ASSETS_SIDE_FALLBACK_MARKER in text)
 
 
 def locate_balance_sheet(pdf_path: str) -> dict:
@@ -64,13 +76,13 @@ def locate_balance_sheet(pdf_path: str) -> dict:
             # Otherwise add the next page (2-page statements).
             indices = [i]
             captured = text
-            if (_TOTAL_ASSETS_MARKER not in captured
+            if (not _has_assets_total(captured)
                     or not _has_equity_total(captured)) and i + 1 < n_pages:
                 indices.append(i + 1)
                 captured = "\n".join(_page_text(doc, j) for j in indices)
 
-            if _TOTAL_ASSETS_MARKER not in captured:
-                # Title without "Total assets" nearby — likely a table of
+            if not _has_assets_total(captured):
+                # Title without an assets total nearby — likely a table of
                 # contents or a cross-reference; keep scanning.
                 continue
 
@@ -103,7 +115,7 @@ def locate_balance_sheet(pdf_path: str) -> dict:
 
     raise RuntimeError(
         "No balance-sheet page found - none of the title variants matched a "
-        "page that also contains 'Total assets'."
+        "page that also contains 'Total assets' (or 'Total current assets')."
     )
 
 
@@ -147,6 +159,21 @@ def extract_printed_totals(captured_text: str) -> dict:
                 totals["total_liabilities"], liab_and_equity, equity,
             )
     return totals
+
+
+_UNIT_LABEL_RE = re.compile(r"\bin\s+(millions|thousands|billions)\b", re.IGNORECASE)
+
+
+def extract_unit_label(text: str):
+    """Read the filing's scale wording ("in millions" / "in thousands")
+    straight from the captured page text, so unit_label never depends on LLM
+    transcription (LlamaParse sometimes drops the "($ in millions)" header
+    line from the markdown entirely). Label only — numbers are NEVER scaled
+    or converted because of it. Returns None when no scale wording is found."""
+    m = _UNIT_LABEL_RE.search(text)
+    if not m:
+        return None
+    return f"in {m.group(1).lower()}"
 
 
 def _export_pages(doc: "fitz.Document", indices: list[int]) -> str:
