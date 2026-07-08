@@ -49,6 +49,17 @@ def _has_assets_total(text: str) -> bool:
             or _ASSETS_SIDE_FALLBACK_MARKER in text)
 
 
+def _has_statement_structure(text: str) -> bool:
+    """Lenient confirmation for filers (e.g. APA) that print EVERY total row
+    unlabeled — no "Total assets" / "Total current assets" text exists on the
+    statement at all. The section headings plus a labeled equity total still
+    identify the page as the balance sheet (a TOC or prose cross-reference
+    never carries all three)."""
+    return ("current assets" in text
+            and "current liabilities" in text
+            and _has_equity_total(text))
+
+
 def locate_balance_sheet(pdf_path: str) -> dict:
     """Find the balance-sheet page(s).
 
@@ -63,60 +74,86 @@ def locate_balance_sheet(pdf_path: str) -> dict:
     warnings: list[str] = []
 
     with fitz.open(pdf_path) as doc:
-        n_pages = len(doc)
-        for i in range(n_pages):
-            text = _page_text(doc, i)
-            matched = next((v for v in variants if v in text), None)
-            if not matched:
-                continue
-
-            # Capture the matched page alone when it already holds the whole
-            # statement (both totals) — a needless next page is a different
-            # statement (e.g. cash flows) that only feeds the LLM noise.
-            # Otherwise add the next page (2-page statements).
-            indices = [i]
-            captured = text
-            if (not _has_assets_total(captured)
-                    or not _has_equity_total(captured)) and i + 1 < n_pages:
-                indices.append(i + 1)
-                captured = "\n".join(_page_text(doc, j) for j in indices)
-
-            if not _has_assets_total(captured):
-                # Title without an assets total nearby — likely a table of
-                # contents or a cross-reference; keep scanning.
-                continue
-
-            # If only "Total assets" is present, extend by one more page to
-            # pick up the liabilities/equity side.
-            if not _has_equity_total(captured) and indices[-1] + 1 < n_pages:
-                indices.append(indices[-1] + 1)
-                captured = "\n".join(_page_text(doc, j) for j in indices)
-
-            if not _has_equity_total(captured):
-                warnings.append(
-                    "Total-equity/liabilities line not confirmed on captured "
-                    "pages; proceeding with the pages found."
-                )
-
-            temp_pdf_path = _export_pages(doc, indices)
-            page_numbers = [j + 1 for j in indices]  # 1-based for traceability
-            original_text = "\n".join(doc[j].get_text("text") for j in indices)
-            logger.info(
-                "Balance sheet located on page(s) %s (title: %r) -> %s",
-                page_numbers, matched, temp_pdf_path,
-            )
-            return {
-                "page_numbers": page_numbers,
-                "temp_pdf_path": temp_pdf_path,
-                "matched_title": matched,
-                "captured_text": original_text,
-                "warnings": warnings,
-            }
+        result = _scan(doc, variants, warnings, lenient=False)
+        if result is None:
+            # No page passed the labeled-total check. Some filers (e.g. APA)
+            # print every total row unlabeled, so re-scan accepting the
+            # statement's structure (section headings + equity total) instead.
+            result = _scan(doc, variants, warnings, lenient=True)
+        if result is not None:
+            return result
 
     raise RuntimeError(
         "No balance-sheet page found - none of the title variants matched a "
         "page that also contains 'Total assets' (or 'Total current assets')."
     )
+
+
+def _scan(doc: "fitz.Document", variants: list[str], warnings: list[str],
+          lenient: bool):
+    """One pass over the document; returns the locate result dict or None.
+
+    Strict mode confirms a title match with a labeled assets total ("Total
+    assets" / "Total current assets"). Lenient mode confirms with the
+    statement's section headings + equity total instead — for filers whose
+    total rows are all unlabeled."""
+    confirm = _has_statement_structure if lenient else _has_assets_total
+    n_pages = len(doc)
+    for i in range(n_pages):
+        text = _page_text(doc, i)
+        matched = next((v for v in variants if v in text), None)
+        if not matched:
+            continue
+
+        # Capture the matched page alone when it already holds the whole
+        # statement (both totals) — a needless next page is a different
+        # statement (e.g. cash flows) that only feeds the LLM noise.
+        # Otherwise add the next page (2-page statements).
+        indices = [i]
+        captured = text
+        if (not confirm(captured)
+                or not _has_equity_total(captured)) and i + 1 < n_pages:
+            indices.append(i + 1)
+            captured = "\n".join(_page_text(doc, j) for j in indices)
+
+        if not confirm(captured):
+            # Title without an assets total nearby — likely a table of
+            # contents or a cross-reference; keep scanning.
+            continue
+
+        # If only "Total assets" is present, extend by one more page to
+        # pick up the liabilities/equity side.
+        if not _has_equity_total(captured) and indices[-1] + 1 < n_pages:
+            indices.append(indices[-1] + 1)
+            captured = "\n".join(_page_text(doc, j) for j in indices)
+
+        if not _has_equity_total(captured):
+            warnings.append(
+                "Total-equity/liabilities line not confirmed on captured "
+                "pages; proceeding with the pages found."
+            )
+        if lenient:
+            warnings.append(
+                "No labeled 'Total assets' / 'Total current assets' line on "
+                "the statement (all total rows unlabeled); page located via "
+                "section headings + equity total instead."
+            )
+
+        temp_pdf_path = _export_pages(doc, indices)
+        page_numbers = [j + 1 for j in indices]  # 1-based for traceability
+        original_text = "\n".join(doc[j].get_text("text") for j in indices)
+        logger.info(
+            "Balance sheet located on page(s) %s (title: %r, lenient=%s) -> %s",
+            page_numbers, matched, lenient, temp_pdf_path,
+        )
+        return {
+            "page_numbers": page_numbers,
+            "temp_pdf_path": temp_pdf_path,
+            "matched_title": matched,
+            "captured_text": original_text,
+            "warnings": warnings,
+        }
+    return None
 
 
 def extract_printed_totals(captured_text: str) -> dict:
