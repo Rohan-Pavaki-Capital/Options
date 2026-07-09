@@ -28,9 +28,10 @@ except Exception:
 UA = "Mozilla/5.0 (options-extractor-ir-fetch/0.1)"
 TIMEOUT = 20
 CURRENT_YEAR = 2026  # from project context; FY2025 reports are the latest expected
-# Hard freshness floor: reject any report older than this fiscal year (per request —
-# "max old year should be 2024, not older than that"). At CURRENT_YEAR=2026 that's 2024.
-MIN_FISCAL_YEAR = CURRENT_YEAR - 2
+# Hard freshness floor: reject any report older than this fiscal year (per request
+# 2026-07-09 — "for annual report only use 2025 annual report"; supersedes the earlier
+# "max old year should be 2024" rule). At CURRENT_YEAR=2026 that's 2025.
+MIN_FISCAL_YEAR = CURRENT_YEAR - 1
 
 # Playwright render tuning (latency control). "load" waits for ALL resources and
 # routinely burns the full timeout on slow IR sites; "domcontentloaded" is enough to

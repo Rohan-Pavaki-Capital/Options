@@ -24,7 +24,7 @@ TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
 # Together AI exposes an OpenAI-compatible API; change these two constants
 # (or set BALANCE_SHEET_MODEL in .env) to switch provider/model.
 LLM_BASE_URL = "https://api.together.xyz/v1"
-LLM_MODEL = os.getenv("BALANCE_SHEET_MODEL", "meta-llama/Llama-3.3-70B-Instruct-Turbo")
+LLM_MODEL = os.getenv("BALANCE_SHEET_MODEL", "deepseek-ai/DeepSeek-V4-Pro")
 
 # Stage 1 — balance-sheet title variants (matched case-insensitively).
 TITLE_VARIANTS = [

@@ -1888,6 +1888,19 @@ def run_extraction_pipeline(job_id: str):
         build_workbook(str(json_path), str(excel_path))
         xlsx_bytes = excel_path.read_bytes()
 
+        # ── Evidence PDF (user request 2026-07-09): save the exact pages the
+        # extraction referred to, trimmed + highlighted, to HareKrishna/
+        # <TICKER>_<FORM>.pdf. Best-effort — never fails the pipeline.
+        try:
+            from core.evidence import save_evidence_pdf
+            _ev = save_evidence_pdf(str(pdf_path), target_pages,
+                                    JOBS.get(job_id, {}), final=final)
+            if _ev is not None:
+                print(f"[{job_id}] evidence PDF: {_ev}", flush=True)
+        except Exception as _ev_exc:
+            print(f"[{job_id}] evidence PDF skipped: {_ev_exc}",
+                  file=sys.stderr)
+
         extraction_id = None
         try:
             extraction_id = save_extraction(final, xlsx_bytes, excel_path.name)
@@ -3713,6 +3726,21 @@ async def _bs_run_job(bs_job_id: str, payload: FetchFilingRequest):
         # The pipeline itself never crashes — failures come back as JSON with
         # "warnings" (and an "error" field), passed through inside the result.
         result = await run_in_threadpool(run_balance_sheet, str(pdf_path))
+
+        # ── Evidence PDF (user request 2026-07-09): save the located
+        # balance-sheet pages, highlighted, to HareRam/. Best-effort — the
+        # job result is never affected by an evidence failure.
+        try:
+            from core.evidence import save_bs_evidence_pdf
+            _ev = await run_in_threadpool(
+                save_bs_evidence_pdf, str(pdf_path),
+                result.get("source_pages") or [], job, result)
+            if _ev:
+                print(f"[{bs_job_id}] BS evidence PDF: {_ev}", flush=True)
+        except Exception as _ev_exc:
+            print(f"[{bs_job_id}] BS evidence PDF skipped: {_ev_exc}",
+                  flush=True)
+
         BS_JOBS[bs_job_id] = {"status": "done", "result": result,
                               "created": time.time()}
     except HTTPException as exc:
@@ -3931,6 +3959,59 @@ async def excel_options(
             finally:
                 _cleanup_job(job_id)
 
+        async def _run_ir_annual():
+            """IR-website fallback (2026-07-09): fetch the company's ANNUAL
+            REPORT from its own IR site (Diamond IR-scraper) and run the SAME
+            full pipeline (Stage 0 fetch + Stages 1/2/3). country is left
+            blank so the scraper is the primary route, and the last-resort
+            EDGAR retry is disabled — the 10-Q/10-K were already tried.
+            Returns (result_dict_or_None, error_str_or_None); never raises."""
+            from fastapi.concurrency import run_in_threadpool as _rtp
+            job_id = None
+            try:
+                name = (company_name or "").strip()
+                if not name:
+                    # IR resolution needs a real company name; EDGAR knows it.
+                    try:
+                        from markets.edgar_fetch import _ensure_identity
+                        _ensure_identity()
+                        from edgar import Company as _EdgarCompany
+                        name = (getattr(_EdgarCompany(ticker), "name", "")
+                                or "").strip()
+                    except Exception:
+                        name = ""
+                if not name:
+                    name = ticker
+                job_id = create_job(
+                    filename=f"{ticker}_IR_Annual.pdf",
+                    file_size=0,
+                    source="diamond",
+                    source_meta={
+                        "company_name": name,
+                        "ticker": ticker,
+                        "category": "annual",
+                        "country": "",              # blank -> IR-scraper primary
+                        "no_edgar_fallback": True,  # 10-Q/10-K already tried
+                    },
+                )
+                await _rtp(run_extraction_pipeline, job_id)
+                job = JOBS.get(job_id, {})
+                if job.get("status") == "failed":
+                    return None, f"IR fallback failed: {job.get('error')}"
+                json_path = get_job_dir(job_id) / "extraction.json"
+                if not json_path.exists():
+                    return None, "IR fallback produced no extraction result"
+                with open(json_path, "r", encoding="utf-8") as f:
+                    res = json.load(f)
+                if isinstance(res, dict) and res.get("error"):
+                    detail = str(res.get("details") or "")[:300]
+                    return None, f"{res['error']}: {detail}".strip().rstrip(":")
+                return (res if isinstance(res, dict) else {}), None
+            except Exception as exc:
+                return None, f"IR fallback: {type(exc).__name__}: {exc}"
+            finally:
+                _cleanup_job(job_id)
+
         is_us = _OPTIONS_COUNTRY_TO_SOURCE.get(country_norm.lower()) == "edgar"
         explicit_form = bool((form or "").strip())
 
@@ -3953,11 +4034,26 @@ async def excel_options(
             # No usable 10-Q option data -> use the 10-K instead.
             result_k, err_k = await _run("10-K")
             plans_k = map_plans_to_excel(result_k or {})
+            if plans_k:
+                return _finalize({"ticker": ticker,
+                                  "currency": (result_k or {}).get("currency"),
+                                  "option_plans": plans_k})
+
+            # ── IR-website fallback (2026-07-09): NEITHER the 10-Q NOR the
+            # 10-K yielded any option plans -> fetch the annual report from
+            # the company's own IR website and run the full pipeline on it.
+            result_ir, err_ir = await _run_ir_annual()
+            plans_ir = map_plans_to_excel(result_ir or {})
             out = {"ticker": ticker,
-                   "currency": (result_k or {}).get("currency"),
-                   "option_plans": plans_k}
-            if not plans_k and err_k:
-                out["error"] = err_k
+                   "currency": ((result_ir if plans_ir else result_k)
+                                or {}).get("currency"),
+                   "option_plans": plans_ir}
+            if plans_ir:
+                out["source"] = "ir_annual_report"
+            else:
+                errs = "; ".join(e for e in (err_k, err_ir) if e)
+                if errs:
+                    out["error"] = errs
             return _finalize(out)
 
         # ── Single run: non-US market, or an explicitly requested form ──
@@ -4116,6 +4212,22 @@ async def list_jobs():
 # the /simply route isn't swallowed by the SPA mount.
 from routes.simply_route import router as simply_router
 app.include_router(simply_router)
+
+
+# ─── USA XBRL comparison route (standalone prototype) ──────────────
+# Extracts options data straight from SEC XBRL facts (no PDF/LLM) for
+# side-by-side comparison with the PDF pipeline. Lives in the "USA xbrl"
+# folder — the space in the name rules out a normal import, so the module
+# is loaded from its file path.
+import importlib.util as _xbrl_ilu
+
+_XBRL_SERVICE = Path(__file__).parent / "USA xbrl" / "xbrl_service.py"
+if _XBRL_SERVICE.is_file():
+    _xbrl_spec = _xbrl_ilu.spec_from_file_location("usa_xbrl_service", str(_XBRL_SERVICE))
+    _xbrl_mod = _xbrl_ilu.module_from_spec(_xbrl_spec)
+    _xbrl_spec.loader.exec_module(_xbrl_mod)
+    if getattr(_xbrl_mod, "router", None) is not None:
+        app.include_router(_xbrl_mod.router)
 
 
 # ─── Serve the built React frontend (single-origin) ────────────────

@@ -184,6 +184,17 @@ WHAT YOU IGNORE (DO NOT EXTRACT)
 
 Even if these appear on the page, IGNORE them:
 
+▷ "EQUITY COMPENSATION PLAN INFORMATION" TABLE (US filings, Item 12 /
+  proxy-style disclosure)
+  - Columns like "Number of securities to be issued upon exercise",
+    "Weighted-average exercise price of outstanding options, warrants
+    and rights", "Number of securities remaining available for future
+    issuance under equity compensation plans"
+  - Rows like "Equity compensation plans approved by security holders"
+  - This is a PLAN-AUTHORIZATION summary, NOT the notes' share-based
+    compensation disclosure. Extract plans ONLY from the notes section
+    (the share-based compensation / stock-based compensation footnote).
+
 ▷ ACCOUNTING POLICY TEXT
   - "The fair value of equity-settled share options granted is 
      recognised as an employee expense..."

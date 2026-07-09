@@ -88,11 +88,19 @@ Keep these OUT of every bucket above; they exist only so the totals reconcile:
      grouped with current "Deferred income". NOT other_current_liabilities.
    - A CURRENT asset "income taxes receivable" → tax (current asset bucket).
    - Non-current deferred income / deferred income taxes (liability) → deferred_rev_and_tax (non-current).
+4. CONTRACT ASSETS (current or non-current) → always accounts_trade_receivable. Treat them
+   as trade-type receivables regardless of how the filing labels them (e.g. "Contract assets",
+   "Unbilled receivables", "Costs and estimated earnings in excess of billings").
+5. LONG-TERM DEBT IS MEMO-ONLY. Non-current interest-bearing debt (bonds, notes, term loans,
+   long-term borrowings) goes to memo.long_term_debt and NOWHERE ELSE. Never also place it in
+   other_liabilities or any non-current bucket. Counting it in both breaks the liability tally.
 
 ## CORE RULES
 - Use ONLY the most-recent period column. Copy numbers exactly (strip only "$" and commas);
-  negatives stay negative. Never invent a number — every value is a printed line value, or a
-  " + " chain of printed line values when several lines share one bucket.
+  negatives stay negative. Never invent a number — every value is a printed line value, or the
+  arithmetic SUM of printed line values when several lines share one bucket. When several lines
+  share a bucket, output the computed SUM as a single JSON number — never an expression string.
+  E.g. PP&E lines 46139, 445, 532, -34292 → "ppe": 12824 (NOT "46139 + 445 + 532 + -34292").
 - Equity is NOT mapped anywhere (common stock, paid-in capital, retained earnings, treasury
   stock, AOCI, noncontrolling interests) — leave it out entirely.
 
@@ -105,7 +113,7 @@ cash/receivables/inventory/short-term → current; property/long-term investment
 - Operating PP&E (net) → ppe. Real estate that IS the business (REITs) → real_estate_assets.
 - Right-of-use lease assets → lease_assets (current if the filing lists it current).
 - Trade receivables, notes receivable, current financing receivables held for investment,
-  other trade-type receivables → accounts_trade_receivable. Inventory → inventory.
+  other trade-type receivables, contract assets → accounts_trade_receivable. Inventory → inventory.
 - Deferred costs (current), prepaid expenses, restricted cash, held-for-sale current items,
   other misc current assets → other_current_assets.
 - current portion of long-term debt / short-term borrowings / notes payable / commercial paper
@@ -116,9 +124,11 @@ cash/receivables/inventory/short-term → current; property/long-term investment
   lease_liabilities ; everything else non-current misc → other_liabilities.
 
 ## SINGLE-COUNT RULE
-Every listed line contributes to exactly one place. Never map a subtotal AND its components
-(e.g. never map "Total inventory" when "Finished goods" and "Work in process" are already
-mapped). If a line is in a specific bucket it must not also sit in an other_* bucket or a memo field.
+Every listed line contributes to exactly one place — one bucket OR one memo field, never both.
+In particular, a long-term debt line mapped to memo.long_term_debt must NOT also appear in
+other_liabilities. Never map a subtotal AND its components (e.g. never map "Total inventory"
+when "Finished goods" and "Work in process" are already mapped). If a line is in a specific
+bucket it must not also sit in an other_* bucket or a memo field.
 
 ## OFFSETTING / CUSTODIAL BALANCES (banks, brokers, exchanges, clearing houses)
 Performance-bond / guaranty-fund / margin / segregated customer balances appear on BOTH sides
@@ -128,9 +138,12 @@ in near-equal amounts. If you map such a balance as a liability, also map the ma
 1. Every current-section line is in a current bucket or the cash memo; non-current lines are not.
 2. sum(asset buckets) + cash + goodwill + intangibles == printed Total Assets (within rounding).
 3. sum(liability buckets) + long_term_debt == printed Total Liabilities (within rounding).
+3b. Confirm memo.long_term_debt lines are absent from other_liabilities and all non-current
+    buckets (no debt line counted twice).
 4. No line double-counted; none dropped; no equity mapped; no plug inserted.
-5. House Conventions 1–3 obeyed (investment_assets narrow; sundry/financing receivables in
-   other_assets; current "Taxes" in deferred_rev_and_tax).
+5. House Conventions 1–5 obeyed (investment_assets narrow; sundry/financing receivables in
+   other_assets; current "Taxes" in deferred_rev_and_tax; contract assets in
+   accounts_trade_receivable; long-term debt memo-only).
 
 ## DECISION
 - All checks pass → return the full JSON.

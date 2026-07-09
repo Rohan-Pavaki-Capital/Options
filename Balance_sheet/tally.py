@@ -51,10 +51,17 @@ def coerce_number(value, warnings: list, label: str):
             pass
         # The LLM is told to report multi-line buckets as "a + b + c" and let
         # code do the exact addition — accept that form in strings too.
-        if re.fullmatch(r"-?\d+(?:\.\d+)?(?:\s*[+-]\s*\d+(?:\.\d+)?)+", cleaned):
+        # Normalize an operator immediately followed by a sign ("532 + -34292"),
+        # which happens when a negative printed line (e.g. accumulated
+        # depreciation) is chained — otherwise the strict guard below fails.
+        norm = re.sub(r"\+\s*-", "-", cleaned)
+        norm = re.sub(r"-\s*-", "+", norm)
+        norm = re.sub(r"\+\s*\+", "+", norm)
+        norm = re.sub(r"-\s*\+", "-", norm)
+        if re.fullmatch(r"-?\d+(?:\.\d+)?(?:\s*[+-]\s*\d+(?:\.\d+)?)+", norm):
             total = sum(
                 float(t.replace(" ", ""))
-                for t in re.findall(r"[+-]?\s*\d+(?:\.\d+)?", cleaned)
+                for t in re.findall(r"[+-]?\s*\d+(?:\.\d+)?", norm)
             )
             return int(total) if total == int(total) else total
     warnings.append(f"Non-numeric value in {label}: {value!r} - treated as 0.")

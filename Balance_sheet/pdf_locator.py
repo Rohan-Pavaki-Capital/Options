@@ -175,19 +175,24 @@ def extract_printed_totals(captured_text: str) -> dict:
         # exclude "Total liabilities and ..." / "Total liabilities, redeemable ..."
         "total_liabilities": first_number_after(r"total liabilities(?!\s*(?:and|&|,))"),
     }
+    # Total equity — read once (labeled on most filings, including
+    # fully-unlabeled ones like APA that still print "TOTAL EQUITY"). Kept so
+    # the pipeline can derive total_liabilities = total_assets - total_equity
+    # when no liabilities total is printed at all.
+    equity = first_number_after(
+        r"total\s+(?:shareholders|stockholders)\W{0,2}\s*equity"
+    )
+    if equity is None:
+        equity = first_number_after(r"total\s+equity")
+    totals["total_equity"] = equity
+
     if totals["total_liabilities"] is None:
-        # No explicit "Total liabilities" line (e.g. NIKE) — derive it in CODE
-        # from two lines that ARE printed: Total liabilities & equity minus
-        # total equity. Without this the LLM's self-computed total becomes the
-        # tally target, which lets a mis-map/hallucination grade itself.
+        # First try the printed "Total liabilities & equity" - total equity
+        # derivation (e.g. NIKE). Without this the LLM's self-computed total
+        # becomes the tally target, letting a mis-map grade itself.
         liab_and_equity = first_number_after(
             r"total liabilities\s*(?:and|&|,)[^\n]{0,60}?equity"
         )
-        equity = first_number_after(
-            r"total\s+(?:shareholders|stockholders)\W{0,2}\s*equity"
-        )
-        if equity is None:
-            equity = first_number_after(r"total\s+equity")
         if liab_and_equity is not None and equity is not None and 0 < equity < liab_and_equity:
             totals["total_liabilities"] = liab_and_equity - equity
             logger.info(
@@ -195,6 +200,9 @@ def extract_printed_totals(captured_text: str) -> dict:
                 "liabilities & equity) - %s (total equity).",
                 totals["total_liabilities"], liab_and_equity, equity,
             )
+        # Still None (e.g. APA — nothing labeled but TOTAL EQUITY): the
+        # pipeline derives it from total_assets - total_equity once
+        # total_assets is in place.
     return totals
 
 

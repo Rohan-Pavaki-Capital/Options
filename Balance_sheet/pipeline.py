@@ -77,13 +77,29 @@ def run_markdown_pipeline(markdown: str, source_pages: list | None = None,
     unit_label = unit_label or pdf_locator.extract_unit_label(markdown)
 
     def _apply_printed_totals(res: dict) -> None:
-        for key, value in printed_totals.items():
+        for key in ("total_assets", "total_liabilities"):
+            value = printed_totals.get(key)
             if value is not None and res["filing_totals"].get(key) != value:
                 logger.info(
                     "Overriding LLM %s=%s with printed value %s",
                     key, res["filing_totals"].get(key), value,
                 )
                 res["filing_totals"][key] = value
+        # Fully-unlabeled statement (e.g. APA): no printed 'Total liabilities'
+        # and no 'Total liabilities and equity' to derive from, so code read
+        # nothing and the LLM's (often wrong) value would otherwise stand.
+        # Total equity IS labeled; since Total assets == Total liabilities +
+        # equity, derive the split from code-read equity — the LLM never grades
+        # its own liabilities tally.
+        if printed_totals.get("total_liabilities") is None:
+            te = printed_totals.get("total_equity")
+            ta = res["filing_totals"].get("total_assets")
+            if te and ta and 0 < te < ta:
+                res["filing_totals"]["total_liabilities"] = ta - te
+                logger.info(
+                    "Derived total_liabilities = %s (total_assets %s - "
+                    "code-read total_equity %s).", ta - te, ta, te,
+                )
 
     # Stage 3 — LLM standardization into the fixed schema
     try:

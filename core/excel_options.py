@@ -112,7 +112,10 @@ def _classify_plan(plan):
         strike = _to_float(plan.get("weighted_avg_grant_date_fair_value"))
         if strike is None or strike == 0:
             strike = 0.1
-        maturity = _to_float(plan.get("vesting_period_years"))
+        # WARCL-first, same fallback chain as the option branch.
+        maturity = _to_float(plan.get("weighted_avg_remaining_contractual_life_years"))
+        if maturity is None:
+            maturity = _to_float(plan.get("vesting_period_years"))
         if maturity is None:
             maturity = 4.0
         return {
