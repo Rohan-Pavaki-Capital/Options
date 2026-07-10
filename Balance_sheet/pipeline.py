@@ -191,6 +191,9 @@ def run_markdown_pipeline(markdown: str, source_pages: list | None = None,
         logger.info("Overriding LLM unit_label=%r with code-read %r",
                     result.get("unit_label"), unit_label)
         result["unit_label"] = unit_label
+
+    # Final step: convert everything to millions (unit_label is finalized above)
+    tally.normalize_to_millions(result)
     return result
 
 

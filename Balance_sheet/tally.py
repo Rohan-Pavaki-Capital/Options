@@ -535,3 +535,59 @@ def sanity_check_other_buckets(result: dict) -> dict:
                     f"into other_*."
                 )
     return result
+
+
+_UNIT_FACTORS_TO_MILLIONS = {"thousands": 0.001, "millions": 1.0, "billions": 1000.0}
+
+
+def normalize_to_millions(result: dict) -> dict:
+    """Convert every numeric value to millions, whatever the filing's native
+    scale. Run LAST — after the tally has passed in native units — so scaling
+    (a linear op) never affects reconciliation. thousands ÷ 1,000, millions
+    unchanged, billions × 1,000. Exact for thousands (whole-thousand lines →
+    at most 3 decimals). Original scale is recorded in original_unit_label; if
+    the scale was never identified, values are left as-is with a warning
+    (guessing the unit would be worse than being honest)."""
+    label = (result.get("unit_label") or "").lower()
+    factor = unit_word = None
+    for word, f in _UNIT_FACTORS_TO_MILLIONS.items():
+        if word in label:
+            factor, unit_word = f, word
+            break
+    if factor is None:
+        result.setdefault("warnings", []).append(
+            "Unit scale not identified - values left in the filing's original "
+            "unit; NOT converted to millions."
+        )
+        return result
+    if factor == 1.0:
+        result["unit_label"] = "in millions"
+        return result  # already millions — nothing to scale
+
+    def scale(v):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return v
+        out = round(v * factor, 3)
+        return int(out) if out == int(out) else out
+
+    for sub in ("non_current", "current"):
+        for k in result["assets"][sub]:
+            result["assets"][sub][k] = scale(result["assets"][sub][k])
+        for k in result["liabilities"][sub]:
+            result["liabilities"][sub][k] = scale(result["liabilities"][sub][k])
+    for k in ("preferred_stock", "mezzanine_equity"):
+        result["liabilities"][k] = scale(result["liabilities"][k])
+    for k in result["memo_excluded"]:
+        result["memo_excluded"][k] = scale(result["memo_excluded"][k])
+    for k in ("total_assets", "total_liabilities"):
+        result["filing_totals"][k] = scale(result["filing_totals"][k])
+    for k in ("sum_assets", "sum_liabilities"):
+        result["tally"][k] = scale(result["tally"][k])
+
+    result["original_unit_label"] = f"in {unit_word}"
+    result["unit_label"] = "in millions"
+    result.setdefault("warnings", []).append(
+        f"All values converted from '{unit_word}' to millions (x{factor}); "
+        f"original scale recorded in original_unit_label."
+    )
+    return result
