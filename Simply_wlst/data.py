@@ -48,6 +48,11 @@ FUTURE_SERIES = {"merged_future_revenue": "revenue",
 # Statement-blob line items (for the most recent reported December year).
 HIST = {"TOTAL_REV": "revenue", "BASIC_EPS": "eps", "NI": "earnings", "CASH_OPER": "cfo"}
 
+# Per-period items from the raw_data estimates blob — the merged_future_*
+# series don't carry these two. REVENUE_NUM_EST is what the SWS forecast
+# table shows as "Avg. No. Analysts".
+EXTRAS = {"FCF_EST": "fcf", "REVENUE_NUM_EST": "analysts"}
+
 
 def session():
     s = http.Session(impersonate=IMP) if IMP else http.Session()
@@ -230,6 +235,35 @@ def _latest_fye_actual(state, fye_month):
     return rows[max(rows)] if rows else None
 
 
+def _estimate_extras(state, fye_month):
+    """Per-fiscal-year EXTRAS (FCF consensus, analyst count) from the raw_data
+    estimates blob: {date-ms: {name: {id, value, ...}}} -> {'YYYY-MM': {col: val}}."""
+    out = {}
+    def walk(n):
+        if isinstance(n, dict):
+            for k, v in n.items():
+                if k == "estimates" and isinstance(v, dict):
+                    for ms, items in v.items():
+                        if not (str(ms).isdigit() and isinstance(items, dict)):
+                            continue
+                        d = datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc)
+                        if d.month != fye_month:
+                            continue
+                        r = {}
+                        for it in items.values():
+                            if isinstance(it, dict) and it.get("id") in EXTRAS and it.get("value") is not None:
+                                col = EXTRAS[it["id"]]
+                                r[col] = int(it["value"]) if col == "analysts" else round(it["value"])
+                        if r:
+                            out[d.strftime("%Y-%m")] = r
+                else:
+                    walk(v)
+        elif isinstance(n, list):
+            for v in n: walk(v)
+    walk(state)
+    return out
+
+
 def extract_forecast(state, with_last_actual=True):
     """Annual table (any fiscal year-end): forward consensus + latest reported year.
     FYE month is auto-detected per company, so Dec, Jan, Jun, etc. all work."""
@@ -244,6 +278,11 @@ def extract_forecast(state, with_last_actual=True):
                     continue
                 r = rows.setdefault(d.strftime("%Y-%m"), {"date": d.strftime("%Y-%m")})
                 r[col] = round(val, 2) if col == "eps" else round(val)
+    # Attach EXTRAS to forecast rows only — the reported year has no forward
+    # consensus, so it stays without fcf/analysts (shown as N/A downstream).
+    for k, extra in _estimate_extras(state, fye).items():
+        if k in rows:
+            rows[k].update(extra)
     if with_last_actual:
         a = _latest_fye_actual(state, fye)
         if a and a["date"] not in rows:

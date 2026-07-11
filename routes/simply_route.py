@@ -133,11 +133,12 @@ def api_simply_grouped(
         "source": "Simply Wall St",
         "rev_est": _series("revenue"),
         "eps_est": _series("eps"),
-        # Standalone combined table (newest-first), separate from the est series.
+        # Standalone combined table (newest-first, top 3 rows only — drops the
+        # reported year), separate from the est series.
         "summary_table": {
             "columns": _TABLE_COLS,
             "headers": _TABLE_HEADERS,
-            "rows": [_summary_row(r) for r in reversed(rows)],
+            "rows": [_summary_row(r) for r in list(reversed(rows))[:3]],
         },
     }
 
