@@ -14,6 +14,7 @@ path so this stays isolated from the rest of the backend.
 """
 from __future__ import annotations
 
+import calendar
 import importlib.util
 import io
 from pathlib import Path
@@ -31,6 +32,32 @@ _spec.loader.exec_module(_sws)
 # revenue / earnings / cfo are US$m; eps is per-share; date is YYYY-MM.
 _COLUMNS = ["date", "revenue", "eps", "earnings", "cfo"]
 _HEADERS = ["Period", "Revenue", "EPS", "Earnings", "CFO"]
+
+# Standalone summary table exposed by /api/simply/grouped, separate from the
+# per-metric rev_est/eps_est series. Newest-first rows, date as DD/MM/YYYY.
+_TABLE_COLS = ["date", "revenue", "earnings", "fcf", "cfo", "analysts"]
+_TABLE_HEADERS = ["Date", "Revenue", "Earnings", "Free Cash Flow",
+                  "Cash from Op", "Avg. No. Analysts"]
+
+
+def _fye_date(period: str) -> str:
+    """'YYYY-MM' -> 'DD/MM/YYYY' at the last day of that fiscal-year-end month."""
+    y, m = (int(x) for x in period.split("-"))
+    last_day = calendar.monthrange(y, m)[1]
+    return f"{last_day:02d}/{m:02d}/{y}"
+
+
+def _summary_row(r: dict) -> dict:
+    """One summary-table row; analysts is 'N/A' on the reported year (no key)."""
+    return {
+        "date": _fye_date(r["date"]),
+        "revenue": r.get("revenue"),
+        "earnings": r.get("earnings"),
+        "fcf": r.get("fcf"),
+        "cfo": r.get("cfo"),
+        "analysts": r.get("analysts", "N/A"),
+    }
+
 
 router = APIRouter()
 
@@ -106,6 +133,12 @@ def api_simply_grouped(
         "source": "Simply Wall St",
         "rev_est": _series("revenue"),
         "eps_est": _series("eps"),
+        # Standalone combined table (newest-first), separate from the est series.
+        "summary_table": {
+            "columns": _TABLE_COLS,
+            "headers": _TABLE_HEADERS,
+            "rows": [_summary_row(r) for r in reversed(rows)],
+        },
     }
 
 
