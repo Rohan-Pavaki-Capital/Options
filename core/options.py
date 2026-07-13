@@ -973,6 +973,23 @@ Examples:
     # Final quality validation — adds _validation_summary with completeness metrics
     final = validate_final_output(final)
 
+    # Company comment (analyst note) — Firecrawl search + one Claude call in
+    # the fixed 5-step format. Best-effort — never fails the run.
+    if final.get("company_name"):
+        try:
+            from core.comment import generate_comment
+            log("\n📝 Generating company comment...")
+            note = generate_comment(
+                client, final["company_name"],
+                quarter_label=final.get("report_period"),
+                cost_tracker=cost_tracker,
+            )
+            if note:
+                final["company_comment"] = note["comment"]
+                final["company_comment_sources"] = note["sources"]
+        except Exception as e:
+            log(f"   ⚠ Comment skipped: {e}")
+
     final["_meta"] = {
         "source_pdf": os.path.basename(pdf_path),
         "total_pdf_pages": total_pages,

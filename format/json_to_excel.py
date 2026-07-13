@@ -408,6 +408,20 @@ def build_executive_summary(wb, data):
         s[f"A{row}"].font = ITALIC_FONT
         s.merge_cells(f"A{row}:G{row}")
 
+    # Comments (analyst note) — only when the pipeline produced one
+    if has_value(data.get("company_comment")):
+        row += 3
+        s[f"A{row}"] = "Comments"
+        style_h2(s[f"A{row}"])
+        s.merge_cells(f"A{row}:G{row}")
+
+        row += 1
+        s[f"A{row}"] = data["company_comment"]
+        s[f"A{row}"].font = DATA_FONT
+        s[f"A{row}"].alignment = LEFT_TOP
+        s.merge_cells(f"A{row}:G{row + 11}")
+        row += 11
+
     set_widths(s, [22, 30, 18, 14, 18, 16, 14])
 
 

@@ -37,6 +37,7 @@ from typing import Any, Iterable, Optional
 import requests
 
 _SCRAPE_EP = "https://api.firecrawl.dev/v1/scrape"
+_SEARCH_EP = "https://api.firecrawl.dev/v1/search"
 _CREDIT_EP = "https://api.firecrawl.dev/v1/team/credit-usage"
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/120 Safari/537.36")
@@ -156,6 +157,44 @@ def scrape(
         if attempt < retries:
             time.sleep(2 + attempt * 2)
     raise RuntimeError(f"Firecrawl scrape failed for {url!r}: {last_err}")
+
+
+def search(
+    query: str,
+    limit: int = 5,
+    scrape_content: bool = True,
+    timeout: int = _DEFAULT_TIMEOUT,
+    retries: int = 2,
+) -> list[dict[str, Any]]:
+    """Web search via Firecrawl /v1/search. Returns a list of result dicts:
+    {title, url, description, markdown (when scrape_content=True)}. Search
+    results (news/IR pages) are not bot-walled, so no stealth proxy is used;
+    billing is ~1 credit per scraped result. Raises on failure."""
+    body: dict[str, Any] = {"query": query, "limit": limit}
+    if scrape_content:
+        body["scrapeOptions"] = {"formats": ["markdown"]}
+
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            r = requests.post(
+                _SEARCH_EP,
+                headers={"Authorization": "Bearer " + _key(),
+                         "Content-Type": "application/json"},
+                json=body, timeout=timeout + 30,
+            )
+            j = r.json()
+            if r.status_code == 200 and j.get("success"):
+                results = j.get("data") or []
+                for _ in results:
+                    record_scrape(stealth=False)
+                return results
+            last_err = f"http={r.status_code} body={str(j)[:200]}"
+        except Exception as e:
+            last_err = repr(e)
+        if attempt < retries:
+            time.sleep(2 + attempt * 2)
+    raise RuntimeError(f"Firecrawl search failed for {query!r}: {last_err}")
 
 
 def fetch_pdf(url: str, referer: Optional[str] = None,

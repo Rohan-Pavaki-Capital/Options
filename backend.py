@@ -29,7 +29,7 @@ import uuid
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from core import cache
 
@@ -1867,6 +1867,29 @@ def run_extraction_pipeline(job_id: str):
             "cost": cost_tracker.summary(),
         }
 
+        # ── Company Comment (analyst note) ─────────────────────────
+        # Firecrawl search for the results press release + one Claude call,
+        # composed in the fixed 5-step format. Best-effort — never fails the
+        # job (no FIRECRAWL_API_KEY / no sources → note skipped or degraded).
+        if final.get("company_name"):
+            try:
+                from core.comment import generate_comment
+                _src_meta = job.get("source_meta") or {}
+                _note = generate_comment(
+                    client,
+                    final["company_name"],
+                    quarter_label=final.get("report_period"),
+                    country=(_src_meta.get("country") or "").strip() or None,
+                    cost_tracker=cost_tracker,
+                )
+                if _note:
+                    final["company_comment"] = _note["comment"]
+                    final["company_comment_sources"] = _note["sources"]
+                    print(f"[{job_id}] company comment generated", flush=True)
+            except Exception as _cm_exc:
+                print(f"[{job_id}] company comment skipped: {_cm_exc}",
+                      file=sys.stderr)
+
         # Store this extraction in the results cache so an identical later request
         # (same filing identity) is served instantly without re-extracting.
         if results_key is not None:
@@ -2112,6 +2135,55 @@ async def extract_pdf(
         "filename": file.filename,
         "file_size": len(contents),
     }
+
+
+class CommentRequest(BaseModel):
+    company: str
+    country: Optional[str] = ""      # omit -> inferred from sources
+    industry: Optional[str] = ""     # omit -> inferred from sources
+    # Optional pre-computed stats used VERBATIM in the closing sentence, e.g.
+    # {"net_debt_pct": "23%", "interest_coverage": "4.8 times",
+    #  "fcff_positive_years": "9 out of 10 years", "dividend_yield": "6.4%",
+    #  "methods_upside": "21 of 24 methods", "recommendation": "BUY"}.
+    # Omit -> the note ends after the management comment (no recommendation).
+    financials: Optional[Dict[str, Any]] = None
+
+
+@app.post("/api/comment")
+def company_comment(payload: CommentRequest):
+    """Generate the analyst Comments note for a company.
+
+    Always covers the company's MOST RECENT reported quarter (found via the
+    press-release search). Firecrawl fetches the results press release, then
+    Claude composes the note in the fixed 5-step format: company -> country ->
+    industry, results good/bad, sales/profits direction, verbatim CEO quote
+    (or quarter summary if no quote found), and — only when `financials` are
+    supplied — the balance-sheet close with recommendation. Synchronous: ~30-60 s.
+    """
+    company = (payload.company or "").strip()
+    if not company:
+        raise HTTPException(status_code=400, detail="company is required")
+
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not anthropic_key:
+        raise HTTPException(status_code=500,
+                            detail="ANTHROPIC_API_KEY not configured")
+
+    from core.comment import generate_comment
+    client = anthropic.Anthropic(api_key=anthropic_key)
+    result = generate_comment(
+        client, company,
+        country=(payload.country or "").strip() or None,
+        industry=(payload.industry or "").strip() or None,
+        financials=payload.financials or None,
+    )
+    if not result:
+        raise HTTPException(
+            status_code=502,
+            detail="Comment generation failed (search/LLM error — see server logs)")
+    return {"company": company,
+            "comment": result["comment"],
+            "sources": result["sources"]}
 
 
 class EdgarExtractRequest(BaseModel):
