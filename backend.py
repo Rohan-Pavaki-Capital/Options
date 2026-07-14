@@ -4527,6 +4527,27 @@ if _XBRL_SERVICE.is_file():
         app.include_router(_xbrl_mod.router)
 
 
+# ─── Company industry route (standalone feature, same origin) ──────
+# Adds GET /api/industry — ticker -> Damodaran industry via GuruFocus.
+from Company_Industry.industry_route import router as industry_router
+app.include_router(industry_router)
+
+
+# ─── Credit rating route (standalone feature, same origin) ─────────
+# Adds GET /api/credit-rating — company -> mapped credit rating via
+# Firecrawl. The hyphen in the "Credit-Ratings" folder name rules out a
+# normal import, so the module is loaded from its file path.
+import importlib.util as _credit_ilu
+
+_CREDIT_ROUTE = Path(__file__).parent / "Credit-Ratings" / "credit_route.py"
+if _CREDIT_ROUTE.is_file():
+    _credit_spec = _credit_ilu.spec_from_file_location("credit_route", str(_CREDIT_ROUTE))
+    _credit_mod = _credit_ilu.module_from_spec(_credit_spec)
+    _credit_spec.loader.exec_module(_credit_mod)
+    if getattr(_credit_mod, "router", None) is not None:
+        app.include_router(_credit_mod.router)
+
+
 # ─── Serve the built React frontend (single-origin) ────────────────
 # Mounted AFTER all /api routes so the API always takes precedence.
 from fastapi.staticfiles import StaticFiles
