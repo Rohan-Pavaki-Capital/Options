@@ -62,7 +62,8 @@ def _merge_raw_sides(first_raw: dict, retry_raw: dict, kept: dict) -> dict:
 
 def run_markdown_pipeline(markdown: str, source_pages: list | None = None,
                           printed_totals: dict | None = None,
-                          unit_label: str | None = None) -> dict:
+                          unit_label: str | None = None,
+                          region: str | None = None) -> dict:
     """Stages 3-4 on balance-sheet markdown that is already in hand:
     LLM standardization, then the code tally with the LLM correction loop.
     A side still unbalanced after the retries is returned honestly unbalanced
@@ -101,9 +102,11 @@ def run_markdown_pipeline(markdown: str, source_pages: list | None = None,
                     "code-read total_equity %s).", ta - te, ta, te,
                 )
 
-    # Stage 3 — LLM standardization into the fixed schema
+    # Stage 3 — LLM standardization into the fixed schema. region="eu"
+    # selects the European/IFRS prompt (prompt_eu.py); None/anything else
+    # keeps the existing US prompt.
     try:
-        result = standardizer.standardize(markdown)
+        result = standardizer.standardize(markdown, region=region)
     except Exception as exc:
         logger.exception("Stage 3 (standardize) failed")
         result = empty_result()
@@ -149,7 +152,8 @@ def run_markdown_pipeline(markdown: str, source_pages: list | None = None,
             # The RAW previous JSON goes back to the model — its chains let
             # the model remove a single duplicated term instead of guessing
             # a new bucket total.
-            retry = standardizer.restandardize(markdown, raw, gap_message)
+            retry = standardizer.restandardize(markdown, raw, gap_message,
+                                               region=region)
             retry["source_pages"] = source_pages
             retry_raw = copy.deepcopy(retry)
             tally.coerce_result_numbers(retry)
@@ -197,8 +201,9 @@ def run_markdown_pipeline(markdown: str, source_pages: list | None = None,
     return result
 
 
-def run_pipeline(pdf_path: str) -> dict:
-    """Run the full 4-stage pipeline on a 10-Q/10-K PDF path."""
+def run_pipeline(pdf_path: str, region: str | None = None) -> dict:
+    """Run the full 4-stage pipeline on a 10-Q/10-K PDF path. region="eu"
+    switches Stage 3 to the European/IFRS prompt; default keeps the US one."""
     result = empty_result()
     temp_pdf = None
     try:
@@ -241,7 +246,7 @@ def run_pipeline(pdf_path: str) -> dict:
 
         # Stages 3-4 — standardize + tally
         result = run_markdown_pipeline(markdown, source_pages, printed_totals,
-                                       unit_label)
+                                       unit_label, region=region)
         result["warnings"] = stage1_warnings + result["warnings"]
         return result
     finally:

@@ -33,6 +33,11 @@ _EQUITY_TOTAL_MARKERS = [
     # Unlabeled L&E-total filers (e.g. Conagra) still print the equity total.
     "total stockholders",
     "total shareholders",
+    # IFRS equity-first wording — European statements (BMW, L'Oréal) print
+    # "Total equity and liabilities" / an "Equity & liabilities" section
+    # header and never a standalone "Total liabilities".
+    "equity and liabilities",
+    "equity & liabilities",
 ]
 
 
@@ -94,10 +99,23 @@ def _scan(doc: "fitz.Document", variants: list[str], warnings: list[str],
     """One pass over the document; returns the locate result dict or None.
 
     Strict mode confirms a title match with a labeled assets total ("Total
-    assets" / "Total current assets"). Lenient mode confirms with the
-    statement's section headings + equity total instead — for filers whose
-    total rows are all unlabeled."""
+    assets" / "Total current assets") or — failing that — with the
+    statement's section structure (_has_statement_structure): European
+    filers (e.g. L'Oréal's URD) print every total row as a bare "TOTAL", so
+    no label ever matches. Lenient mode confirms with the structure alone.
+
+    A window whose equity/liabilities side is NOT confirmed is only kept as
+    a last-resort FALLBACK, not accepted outright: a financial-highlights
+    summary page matches title + "Total assets" exactly like the statement
+    does, but never carries the equity side — accepting it outright would
+    shadow the real statement further into the document."""
     confirm = _has_statement_structure if lenient else _has_assets_total
+
+    def ok(text: str) -> bool:
+        return confirm(text) or (not lenient
+                                 and _has_statement_structure(text))
+
+    fallback = None
     n_pages = len(doc)
     for i in range(n_pages):
         text = _page_text(doc, i)
@@ -111,12 +129,12 @@ def _scan(doc: "fitz.Document", variants: list[str], warnings: list[str],
         # Otherwise add the next page (2-page statements).
         indices = [i]
         captured = text
-        if (not confirm(captured)
+        if (not ok(captured)
                 or not _has_equity_total(captured)) and i + 1 < n_pages:
             indices.append(i + 1)
             captured = "\n".join(_page_text(doc, j) for j in indices)
 
-        if not confirm(captured):
+        if not ok(captured):
             # Title without an assets total nearby — likely a table of
             # contents or a cross-reference; keep scanning.
             continue
@@ -128,32 +146,47 @@ def _scan(doc: "fitz.Document", variants: list[str], warnings: list[str],
             captured = "\n".join(_page_text(doc, j) for j in indices)
 
         if not _has_equity_total(captured):
-            warnings.append(
-                "Total-equity/liabilities line not confirmed on captured "
-                "pages; proceeding with the pages found."
-            )
-        if lenient:
+            # Assets side only — remember the first such window and keep
+            # scanning; the real (two-sided) statement may follow.
+            if fallback is None:
+                fallback = (list(indices), matched)
+            continue
+
+        if not _has_assets_total(captured):
             warnings.append(
                 "No labeled 'Total assets' / 'Total current assets' line on "
                 "the statement (all total rows unlabeled); page located via "
                 "section headings + equity total instead."
             )
+        return _build_locate_result(doc, indices, matched, warnings, lenient)
 
-        temp_pdf_path = _export_pages(doc, indices)
-        page_numbers = [j + 1 for j in indices]  # 1-based for traceability
-        original_text = "\n".join(doc[j].get_text("text") for j in indices)
-        logger.info(
-            "Balance sheet located on page(s) %s (title: %r, lenient=%s) -> %s",
-            page_numbers, matched, lenient, temp_pdf_path,
+    if fallback is not None:
+        indices, matched = fallback
+        warnings.append(
+            "Total-equity/liabilities line not confirmed on captured "
+            "pages; proceeding with the pages found."
         )
-        return {
-            "page_numbers": page_numbers,
-            "temp_pdf_path": temp_pdf_path,
-            "matched_title": matched,
-            "captured_text": original_text,
-            "warnings": warnings,
-        }
+        return _build_locate_result(doc, indices, matched, warnings, lenient)
     return None
+
+
+def _build_locate_result(doc: "fitz.Document", indices: list[int],
+                         matched: str, warnings: list[str],
+                         lenient: bool) -> dict:
+    temp_pdf_path = _export_pages(doc, indices)
+    page_numbers = [j + 1 for j in indices]  # 1-based for traceability
+    original_text = "\n".join(doc[j].get_text("text") for j in indices)
+    logger.info(
+        "Balance sheet located on page(s) %s (title: %r, lenient=%s) -> %s",
+        page_numbers, matched, lenient, temp_pdf_path,
+    )
+    return {
+        "page_numbers": page_numbers,
+        "temp_pdf_path": temp_pdf_path,
+        "matched_title": matched,
+        "captured_text": original_text,
+        "warnings": warnings,
+    }
 
 
 def extract_printed_totals(captured_text: str) -> dict:
@@ -227,7 +260,11 @@ def _export_pages(doc: "fitz.Document", indices: list[int]) -> str:
     os.close(fd)
     out = fitz.open()
     try:
-        out.insert_pdf(doc, from_page=indices[0], to_page=indices[-1])
+        # widgets=False: this temp PDF only feeds LlamaParse (text/layout), and
+        # copying form widgets recurses through their parent trees — deeply
+        # nested AcroForms (e.g. BMW annual reports) overflow MuPDF's stack.
+        out.insert_pdf(doc, from_page=indices[0], to_page=indices[-1],
+                       widgets=False)
         out.save(temp_path)
     finally:
         out.close()

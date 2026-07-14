@@ -127,7 +127,12 @@ def save_evidence_pdf(pdf_path: str, pages: list[int], job: dict,
         kept = []
         for pg in pages:
             if pg <= len(src):
-                doc.insert_pdf(src, from_page=pg - 1, to_page=pg - 1)
+                # widgets=False: copying form widgets recurses through their
+                # parent trees — deeply nested AcroForms (e.g. BMW annual
+                # reports) overflow MuPDF's stack. Evidence pages only need
+                # text/layout + our own highlight annotations.
+                doc.insert_pdf(src, from_page=pg - 1, to_page=pg - 1,
+                               widgets=False)
                 kept.append(pg)
         if not kept:
             doc.close()
@@ -241,7 +246,10 @@ def save_bs_evidence_pdf(pdf_path: str, pages: list[int], job: dict,
         kept = []
         for pg in pages:
             if pg <= len(src):
-                doc.insert_pdf(src, from_page=pg - 1, to_page=pg - 1)
+                # widgets=False: same MuPDF stack-overflow guard as the
+                # options evidence above (deeply nested AcroForm PDFs).
+                doc.insert_pdf(src, from_page=pg - 1, to_page=pg - 1,
+                               widgets=False)
                 kept.append(pg)
         if not kept:
             doc.close()

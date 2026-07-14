@@ -3486,6 +3486,15 @@ _OPTIONS_EU_COUNTRIES = {
     "czechia", "czech republic", "liechtenstein",
 }
 
+# Countries whose filings follow the IFRS "statement of financial position"
+# presentation — the balance-sheet standardizer uses the European prompt
+# (Balance_sheet/prompt_eu.py) for these; every other country (incl. the US)
+# keeps the existing prompt.
+_BS_EU_PROMPT_COUNTRIES = _OPTIONS_EU_COUNTRIES | {
+    "germany", "united kingdom", "uk", "great britain", "england",
+    "denmark", "switzerland", "europe", "eu",
+}
+
 
 def _route_options_request(payload, edgar_default_form: str = "10-K"):
     """Shared routing for the unified endpoints: validate {ticker, company_name,
@@ -3677,18 +3686,91 @@ class FetchFilingRequest(BaseModel):
     country: Optional[str] = ""
     category: Optional[str] = None
     form: Optional[str] = None   # only used when the country routes to US EDGAR
+    # Balance-sheet standardize only: force a fresh run, bypassing the 24h
+    # ticker+company_name result cache (the fresh result overwrites the entry).
+    refresh: Optional[bool] = False
+
+
+_ARCHIVE_FY_RE = re.compile(r"^FY(\d{4})_(annual|interim)_", re.I)
+
+
+def _archived_report_path(ticker: str, company_name: str):
+    """Newest usable report saved by POST /api/reports/collect for this
+    company (reports/<ticker>/FY<year>_<annual|interim>_*.pdf). Only files at
+    or above the IR fetcher's freshness floor qualify (same no-stale-data
+    rule as the live crawl); the highest fiscal year wins, annual over
+    interim within a year. Returns (path, fiscal_year, kind) or None."""
+    folder = BASE_DIR / "reports" / _safe_filename_part(ticker or company_name)
+    if not folder.is_dir():
+        return None
+    try:
+        from prototypes.ir_fetch_proto import MIN_FISCAL_YEAR as _floor
+    except Exception:
+        _floor = datetime.utcnow().year - 1
+    best = None
+    for p in folder.glob("*.pdf"):
+        m = _ARCHIVE_FY_RE.match(p.name)
+        if not m:
+            continue
+        fy, kind = int(m.group(1)), m.group(2).lower()
+        if fy < _floor:
+            continue
+        key = (fy, 1 if kind == "annual" else 0)
+        if best is None or key > best[0]:
+            best = (key, p, fy, kind)
+    if best is None:
+        return None
+    return best[1], best[2], best[3]
 
 
 async def _fetch_filing_pdf(payload: FetchFilingRequest):
     """Shared fetch-only flow behind /api/fetch-filing and
     /api/balance-sheet/standardize: route to the per-market handler, create a
     fetch_only job, run the fetch synchronously (no Stage 1/2/3, no LLM).
-    Returns (job_id, pdf_path, job); raises HTTPException on failure."""
+    Returns (job_id, pdf_path, job); raises HTTPException on failure.
+
+    ARCHIVE-FIRST (IR-crawl markets): for sources whose fetch depends on the
+    non-deterministic IR-site crawl (germany, eu), a report previously saved
+    by POST /api/reports/collect under reports/<ticker>/ is reused instead of
+    re-crawling — instant and deterministic. Falls through to the normal
+    fetch when the folder has nothing fresh enough."""
     from fastapi.concurrency import run_in_threadpool
 
     source, handler, Model, kwargs, ticker, company_name, country = (
         _route_options_request(payload, edgar_default_form="LATEST")
     )
+
+    if source in ("germany", "eu"):
+        archived = _archived_report_path(ticker, company_name)
+        if archived is not None:
+            arch_path, arch_fy, arch_kind = archived
+            job_id = create_job(
+                filename=arch_path.name,
+                file_size=arch_path.stat().st_size,
+                source="upload",
+                source_meta={
+                    "ticker": ticker,
+                    "company_name": company_name,
+                    "company": company_name or ticker,
+                    "country": country,
+                    "form": ("Annual Report" if arch_kind == "annual"
+                             else "Interim/Quarterly Report"),
+                    "report_year": arch_fy,
+                    "report_period": arch_fy,
+                    "fetch_path": "reports_archive",
+                },
+            )
+            JOBS[job_id]["fetch_only"] = True
+            for _stage in ("stage1_keywords", "stage2_classifier",
+                           "stage3_extraction", "validation",
+                           "excel_generation"):
+                JOBS[job_id]["stages"].pop(_stage, None)
+            pdf_path = get_job_dir(job_id) / JOBS[job_id]["filename"]
+            shutil.copy2(arch_path, pdf_path)
+            update_job(job_id, status="completed", progress=100)
+            print(f"[{job_id}] archive-first: reusing {arch_path} "
+                  f"(FY{arch_fy} {arch_kind})", flush=True)
+            return job_id, pdf_path, JOBS[job_id]
 
     # Delegate to the dedicated handler with a throwaway BackgroundTasks so it
     # creates the job (running its real validation/resolution) without starting
@@ -3759,6 +3841,72 @@ async def fetch_filing(payload: FetchFilingRequest):
     )
 
 
+class CollectReportsRequest(BaseModel):
+    ticker: Optional[str] = ""
+    company_name: Optional[str] = ""
+    country: Optional[str] = ""
+    # Archive freshness floor: keep reports with fiscal year >= this.
+    # Default (None) = last 3 fiscal years (see fetch_all_reports).
+    min_fiscal_year: Optional[int] = None
+
+
+@app.post("/api/reports/collect")
+async def collect_reports(payload: CollectReportsRequest):
+    """Crawl the company's investor-relations site ONCE and save ALL recent
+    annual + quarterly reports into reports/<ticker>/ — one folder, one file
+    per report (FY2025_annual_*.pdf, FY2026_interim_*.pdf, ...) — for later
+    one-by-one use. Same resolve + crawl logic as the EU/Germany IR scraper
+    (ir_resolve_proto + ir_fetch_proto), but instead of keeping only the best
+    annual/interim pair, EVERY gate-passing report at or above
+    min_fiscal_year is kept. Blocks until the crawl finishes (~1-3 min)."""
+    from fastapi.concurrency import run_in_threadpool
+    from prototypes import ir_fetch_proto as _F
+    from prototypes import ir_resolve_proto as _R
+
+    ticker, country = _normalize_ticker_and_country(
+        payload.ticker, payload.country
+    )
+    company_name = (payload.company_name or "").strip()
+    if not ticker and not company_name:
+        raise HTTPException(
+            status_code=400, detail="ticker or company_name is required"
+        )
+
+    def _run():
+        res = _R.resolve(company_name or "", ticker or "", "", country or "")
+        url = res.get("chosen_url")
+        if not url:
+            raise RuntimeError(
+                "Could not resolve the company's investor-relations site "
+                "from the ticker/name — try supplying company_name."
+            )
+        out_dir = BASE_DIR / "reports" / _safe_filename_part(
+            ticker or company_name
+        )
+        out = _F.fetch_all_reports(
+            str(url), str(out_dir), allow_fc=True,
+            min_fy=payload.min_fiscal_year, name=company_name or ticker,
+        )
+        out["resolver_confidence"] = res.get("confidence")
+        return out
+
+    try:
+        out = await run_in_threadpool(_run)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    if not out["saved"]:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": "No annual/quarterly report passed the content "
+                         "gate on the resolved IR site.",
+                "ir_url": out.get("ir_url"),
+                "probed": out.get("probed"),
+            },
+        )
+    return out
+
+
 # ── Balance-sheet standardize: async job pattern ─────────────────────
 # The fetch + LlamaParse + LLM standardize + tally run takes 30-90s — far too
 # long to hold a client connection open (Excel freezes; proxies return
@@ -3769,6 +3917,24 @@ async def fetch_filing(payload: FetchFilingRequest):
 
 BS_JOBS: dict[str, dict] = {}
 BS_JOB_TTL_SECONDS = 30 * 60
+
+# ── Balance-sheet result cache (user request 2026-07-15) ─────────────
+# Same durable store as the options excel endpoint (core/excel_cache: NeonDB,
+# disk fallback) — the "balance-sheet-v1" prefix keeps the keys separate inside
+# the shared table. A repeat request with the SAME ticker + company_name within
+# the TTL is served from cache: no fetch, no LlamaParse, no LLM. Only
+# successful results are cached; pass {"refresh": true} to force a fresh run.
+BS_CACHE_TTL_SECONDS = int(os.environ.get("BS_CACHE_TTL_SECONDS", 24 * 3600))
+
+
+def _bs_cache_key(payload: "FetchFilingRequest"):
+    """Cache key = normalized ticker + company_name (both must match to hit).
+    Returns None (caching skipped) when both are blank."""
+    ticker = (payload.ticker or "").strip().upper()
+    name = " ".join((payload.company_name or "").strip().lower().split())
+    if not ticker and not name:
+        return None
+    return ("balance-sheet-v1", ticker, name)
 
 # Hard references to in-flight tasks — asyncio only keeps weak refs, so an
 # unreferenced task can be garbage-collected mid-run.
@@ -3795,9 +3961,21 @@ async def _bs_run_job(bs_job_id: str, payload: FetchFilingRequest):
     try:
         job_id, pdf_path, job = await _fetch_filing_pdf(payload)
 
+        # European companies get the IFRS prompt (Balance_sheet/prompt_eu.py);
+        # US and every other market keep the existing prompt. Country comes
+        # from the request (exchange-prefixed tickers override it, same rule
+        # as routing).
+        _, _bs_country = _normalize_ticker_and_country(
+            payload.ticker, payload.country
+        )
+        region = ("eu" if (_bs_country or "").strip().lower()
+                  in _BS_EU_PROMPT_COUNTRIES else None)
+
         # The pipeline itself never crashes — failures come back as JSON with
         # "warnings" (and an "error" field), passed through inside the result.
-        result = await run_in_threadpool(run_balance_sheet, str(pdf_path))
+        result = await run_in_threadpool(
+            run_balance_sheet, str(pdf_path), region
+        )
 
         # ── Evidence PDF (user request 2026-07-09): save the located
         # balance-sheet pages, highlighted, to HareRam/. Best-effort — the
@@ -3812,6 +3990,18 @@ async def _bs_run_job(bs_job_id: str, payload: FetchFilingRequest):
         except Exception as _ev_exc:
             print(f"[{bs_job_id}] BS evidence PDF skipped: {_ev_exc}",
                   flush=True)
+
+        # ── 24h result cache write: successful results only (an "error"
+        # field means a stage failed — always re-run those). excel_cache.set
+        # is best-effort and never raises.
+        if not result.get("error"):
+            _ckey = _bs_cache_key(payload)
+            if _ckey:
+                from core import excel_cache
+                excel_cache.set(_ckey, result)
+                print(f"[{bs_job_id}] BS result cached "
+                      f"(key={_ckey[1]!r}+{_ckey[2]!r}, "
+                      f"ttl={BS_CACHE_TTL_SECONDS}s)", flush=True)
 
         BS_JOBS[bs_job_id] = {"status": "done", "result": result,
                               "created": time.time()}
@@ -3838,7 +4028,14 @@ async def balance_sheet_standardize(payload: FetchFilingRequest):
     per-market routing as /api/fetch-filing: {ticker, company_name, country,
     form?}) and return IMMEDIATELY with a job_id — the fetch + LlamaParse +
     LLM standardize + tally all run in the background (logic unchanged).
-    Poll GET /api/balance-sheet/status?job_id=<id> for the result."""
+    Poll GET /api/balance-sheet/status?job_id=<id> for the result.
+
+    Result cache: a successful result is cached (NeonDB, disk fallback) keyed
+    by ticker + company_name for BS_CACHE_TTL_SECONDS (default 24h). A repeat
+    request within the TTL returns a job that is ALREADY done — the first
+    status poll delivers the full result instantly with "served_from_cache":
+    true (no fetch, no LlamaParse, no LLM). Failures are never cached. Pass
+    {"refresh": true} to bypass and overwrite the cached entry."""
     # Validate the body up front (400 on missing/unsupported input) — pure
     # routing check, no job created, nothing fetched.
     _route_options_request(payload, edgar_default_form="LATEST")
@@ -3846,6 +4043,34 @@ async def balance_sheet_standardize(payload: FetchFilingRequest):
     _bs_cleanup_jobs()
 
     bs_job_id = uuid.uuid4().hex
+
+    # ── 24h result cache read: on a hit the job is born "done", so the
+    # client's normal poll loop gets the result on its first call — no
+    # client change needed. refresh=true skips the read (fresh run then
+    # overwrites the entry).
+    _ckey = _bs_cache_key(payload)
+    if _ckey and not payload.refresh:
+        from core import excel_cache
+        _hit = excel_cache.get(_ckey, BS_CACHE_TTL_SECONDS)
+        if isinstance(_hit, dict):
+            print(f"[{bs_job_id}] BS cache HIT "
+                  f"(key={_ckey[1]!r}+{_ckey[2]!r})", flush=True)
+            BS_JOBS[bs_job_id] = {
+                "status": "done",
+                "result": {**_hit, "served_from_cache": True},
+                "created": time.time(),
+            }
+            return JSONResponse(status_code=202,
+                                content={"job_id": bs_job_id,
+                                         "status": "done"})
+        print(f"[{bs_job_id}] BS cache MISS "
+              f"(key={_ckey[1]!r}+{_ckey[2]!r}) — running full pipeline",
+              flush=True)
+    elif _ckey and payload.refresh:
+        print(f"[{bs_job_id}] BS cache BYPASSED (refresh=true, "
+              f"key={_ckey[1]!r}+{_ckey[2]!r}) — running full pipeline",
+              flush=True)
+
     BS_JOBS[bs_job_id] = {"status": "pending", "created": time.time()}
 
     task = asyncio.create_task(_bs_run_job(bs_job_id, payload))

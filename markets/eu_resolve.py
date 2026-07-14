@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 import urllib.parse
 import urllib.request
 from typing import Any, Optional
@@ -120,6 +121,22 @@ def _name_search(query: str, limit: int = 25) -> list[dict[str, str]]:
         lei = a.get("identifier")
         if lei:
             out.append({"lei": lei, "name": a.get("name") or lei})
+    return out
+
+
+def _query_variants(q: str) -> list[str]:
+    """Spelling variants for the ilike name search, tried in order: as typed;
+    accents folded (é→e — ESEF registers many names unaccented, e.g. L'Oréal
+    is stored as "L'OREAL"); punctuation replaced by the single-char SQL
+    wildcard '_' (apostrophe/hyphen differences)."""
+    out = [q]
+    folded = unicodedata.normalize("NFKD", q)
+    folded = "".join(c for c in folded if not unicodedata.combining(c))
+    if folded not in out:
+        out.append(folded)
+    wild = re.sub(r"[^0-9A-Za-z%\s]", "_", folded)
+    if wild not in out:
+        out.append(wild)
     return out
 
 
@@ -241,33 +258,38 @@ def resolve_company_number(
             _, ctry = _entity_has_filings(lei)
             return _result(lei, name, ctry or country, "isin", [{"lei": lei, "name": name}])
 
-    # 3) Local ticker → convenience map → name search.
-    matched_via = "company_name"
-    queries: list[str] = []
-    if ticker and not company_name:
-        mapped = _TICKER_MAP.get(ticker.upper())
-        if mapped:
-            queries.append(mapped)
-            matched_via = "ticker"
-        # also try the ticker root as a name fragment (last resort)
-        root = re.sub(r"[-.].*$", "", ticker).strip()
-        if len(root) >= 3:
-            queries.append(root)
-            matched_via = matched_via if mapped else "ticker"
-
-    # 4) Explicit company name (highest-quality query, tried first if present).
+    # 3-4) Name-search queries, best-quality first: the explicit company name,
+    # then the ticker convenience map. The map is deliberately NOT suppressed
+    # by a supplied name — a name whose spelling misses the registered form
+    # (e.g. "L'Oréal" vs the registered "L'OREAL") would otherwise block a
+    # ticker ("OR") that the map resolves fine. The bare ticker root stays a
+    # last resort used only when no name was given. Each query is tried in
+    # spelling variants (as typed / accent-folded / punctuation-wildcarded).
+    labeled: list[tuple[str, str]] = []  # (query, matched_via)
     if company_name:
-        queries.insert(0, company_name)
-        matched_via = "company_name"
+        labeled.append((company_name, "company_name"))
+    if ticker:
+        mapped = _TICKER_MAP.get(ticker.upper())
+        if mapped and all(mapped != q for q, _ in labeled):
+            labeled.append((mapped, "ticker"))
+        root = re.sub(r"[-.].*$", "", ticker).strip()
+        if not company_name and len(root) >= 3 \
+                and all(root != q for q, _ in labeled):
+            labeled.append((root, "ticker"))
 
+    matched_via = "company_name"
     seen: set[str] = set()
     candidates: list[dict[str, str]] = []
-    for q in queries:
-        for c in _name_search(q):
-            if c["lei"] not in seen:
-                seen.add(c["lei"])
-                candidates.append(c)
+    for q, via in labeled:
+        for variant in _query_variants(q):
+            for c in _name_search(variant):
+                if c["lei"] not in seen:
+                    seen.add(c["lei"])
+                    candidates.append(c)
+            if candidates:
+                break
         if candidates:
+            matched_via = via
             break
 
     # 5) Last resort: GLEIF name → LEI (then confirm it has ESEF filings).

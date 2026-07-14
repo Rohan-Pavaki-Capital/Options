@@ -17,6 +17,7 @@ from openai import OpenAI
 
 from . import config
 from .config import LLM_BASE_URL, LLM_MODEL, empty_result, require_together_key
+from .prompt_eu import SYSTEM_PROMPT_EU
 
 logger = logging.getLogger("balance_sheet.standardizer")
 
@@ -441,11 +442,18 @@ def _parse_and_validate(raw: str) -> dict:
     return result
 
 
-def standardize(markdown: str) -> dict:
+def _system_prompt(region: str | None) -> str:
+    """Pick the Stage-3 system prompt by company origin: "eu" -> the
+    European/IFRS prompt (prompt_eu.py); anything else -> the existing
+    US-oriented prompt, unchanged."""
+    return SYSTEM_PROMPT_EU if region == "eu" else SYSTEM_PROMPT
+
+
+def standardize(markdown: str, region: str | None = None) -> dict:
     """Map the balance-sheet markdown into the fixed schema. Re-prompts once
     if the LLM output fails to parse/validate; raises if it fails twice."""
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": _system_prompt(region)},
         {"role": "user", "content": _build_user_message(markdown)},
     ]
     raw = _call_llm(messages)
@@ -469,12 +477,13 @@ def standardize(markdown: str) -> dict:
         return _parse_and_validate(raw)  # let a second failure raise
 
 
-def restandardize(markdown: str, previous_json: dict, gap_message: str) -> dict:
+def restandardize(markdown: str, previous_json: dict, gap_message: str,
+                  region: str | None = None) -> dict:
     """Tally-failure hook (Stage 4): re-call the LLM with the previous JSON
     and the exact gap so it can re-map missing/double-counted lines. Called
     in a loop by the pipeline until balanced or max retries."""
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": _system_prompt(region)},
         {"role": "user", "content": _build_user_message(markdown)},
         {"role": "assistant", "content": json.dumps(previous_json)},
         {

@@ -33,6 +33,12 @@ TITLE_VARIANTS = [
     "BALANCE SHEET",
     "STATEMENTS OF FINANCIAL POSITION",
     "CONSOLIDATED STATEMENTS OF FINANCIAL POSITION",
+    # IFRS singular wording (e.g. Scout24) — the plural variants above never
+    # match "Consolidated statement of financial position". Deliberately NOT
+    # the bare "STATEMENT OF FINANCIAL POSITION": management reports carry
+    # "condensed statement of financial position" summary tables (EUR million,
+    # % change) earlier in the document that would shadow the real statement.
+    "CONSOLIDATED STATEMENT OF FINANCIAL POSITION",
 ]
 
 # Stage 4 — rounding-aware tally tolerance. Filings round every printed line,

@@ -639,6 +639,103 @@ def fetch_reports(ir_url: str, allow_fc: bool = True, annual_path: str | None = 
     return out
 
 
+def fetch_all_reports(ir_url: str, out_dir: str, allow_fc: bool = True,
+                      min_fy: int | None = None, max_downloads: int = 25,
+                      name: str = "") -> dict:
+    """Collect-mode variant of fetch_reports: ONE crawl, then probe EVERY
+    annual/interim candidate and save ALL gate-passers into `out_dir` —
+    annuals and quarterlies together, for later one-by-one use.
+
+    The single-report freshness floor (MIN_FISCAL_YEAR) is replaced by
+    `min_fy` (default CURRENT_YEAR - 3) so the archive can include prior
+    years; the content gates are otherwise unchanged (annual: >=40pp with
+    >=2 SBC terms; interim: >=20pp with >=1 SBC term). An undatable doc is
+    not blocked on the year rule, mirroring inspect_pdf.
+
+    Returns {"ir_url", "folder", "saved": [{url, fiscal_year, kind, pages,
+    path}...], "probed": <n>} — `saved` newest-first.
+    """
+    import os
+    min_fy = min_fy or (CURRENT_YEAR - 3)
+    os.makedirs(out_dir, exist_ok=True)
+    ranked_all = find_report_pdfs(ir_url, allow_fc)
+
+    # Candidates = annual-scored (score>0) plus interim-NAMED (any score,
+    # same rationale as fetch_reports), deduped by URL, newest-first.
+    cands, seen_urls = [], set()
+    for sc, u, a in ranked_all:
+        named_interim = bool(re.search(_INTERIM_NAME_RE,
+                                       (str(a) + " " + str(u)).lower()))
+        if (sc > 0 or named_interim) and u not in seen_urls:
+            seen_urls.add(u)
+            cands.append((sc, u, a))
+    cands.sort(key=lambda r: (_pdf_year(r[1], r[2]), r[0]), reverse=True)
+
+    def _gate(info: dict) -> str | None:
+        """Archive gate: kind ('annual'|'interim') or None. min_fy replaces
+        the module freshness floor; a KNOWN year below it is rejected."""
+        if not info.get("ok"):
+            return None
+        fy = info.get("fiscal_year") or 0
+        if fy and fy < min_fy:
+            return None
+        pages = info.get("pages") or 0
+        sbc = len(info.get("sbc_hits") or [])
+        if pages >= 40 and sbc >= 2 and not (info.get("is_interim")
+                                             and not info.get("is_annual")):
+            return "annual"
+        if info.get("is_interim") and pages >= 20 and sbc >= 1:
+            return "interim"
+        return None
+
+    saved, seen_docs, downloads = [], set(), 0
+    for i, (sc, u, a) in enumerate(cands):
+        if downloads >= max_downloads:
+            print(f"    collect: download cap ({max_downloads}) reached — "
+                  f"{len(cands) - i} candidate(s) not probed")
+            break
+        # Save on the FIRST probe (force_save) to avoid re-downloading the
+        # winners; rejects are deleted right after the gate.
+        probe_path = os.path.join(out_dir, f"_probe_{i:02d}.pdf")
+        info = inspect_pdf(u, ir_url, save_path=probe_path, force_save=True)
+        downloads += 1
+        kind = _gate(info)
+        fy = info.get("fiscal_year") or _year_in(unquote(urlparse(u).path))
+        if not kind:
+            if fy and fy < min_fy:
+                note = f"too old (FY{fy} < {min_fy})"
+            else:
+                note = (info.get("gate_note") or info.get("reason")
+                        or "insufficient content")
+            print(f"    collect reject: {note}  {u[:80]}")
+            if os.path.exists(probe_path):
+                os.remove(probe_path)
+            continue
+        # Same document linked under two URLs (mirrors) -> keep one copy.
+        doc_key = (info.get("bytes"), info.get("pages"), fy, kind)
+        if doc_key in seen_docs:
+            print(f"    collect dup: FY{fy} {kind} already saved  {u[:80]}")
+            os.remove(probe_path)
+            continue
+        seen_docs.add(doc_key)
+        base = re.sub(r"[^A-Za-z0-9._-]+", "_",
+                      os.path.basename(unquote(urlparse(u).path)))[:60] or f"{i:02d}.pdf"
+        final = os.path.join(out_dir, f"FY{fy or 'unknown'}_{kind}_{base}")
+        if not final.lower().endswith(".pdf"):
+            final += ".pdf"
+        n = 1
+        while os.path.exists(final):
+            final = re.sub(r"(\.pdf)$", f"_{n}.pdf", final, flags=re.I)
+            n += 1
+        os.replace(probe_path, final)
+        print(f"    collect OK: FY{fy} {kind} {info.get('pages')}pp -> {final}")
+        saved.append({"url": u, "fiscal_year": fy, "kind": kind,
+                      "pages": info.get("pages"), "path": final})
+    saved.sort(key=lambda s: (s["fiscal_year"] or 0), reverse=True)
+    return {"ir_url": ir_url, "folder": out_dir, "saved": saved,
+            "probed": downloads}
+
+
 # ---------------------------------------------------------------- demo
 if __name__ == "__main__":
     allow_fc = "--firecrawl" in sys.argv
