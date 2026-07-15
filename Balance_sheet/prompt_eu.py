@@ -137,7 +137,11 @@ Keep these OUT of every bucket above; they exist only so the totals reconcile:
    non-current bucket. Counting it in both breaks the liability tally.
 
 ## CORE RULES
-- Use ONLY the most-recent period column. Copy numbers exactly (strip only currency symbols
+- Use ONLY the most-recent period column. Column order varies: most filings print the most
+  recent period FIRST, but some (e.g. Portuguese filers) print the OLDEST first (header
+  "31-12-2024 | 31-12-2025") — the most-recent column is the one under the LATEST date,
+  wherever it sits. A "Notes" column of note references may sit between the label and the
+  values; note references are NEVER values. Copy numbers exactly (strip only currency symbols
   like "€"/"$" and commas); negatives stay negative. Never invent a number — every value is a
   printed line value, or the arithmetic SUM of printed line values when several lines share one
   bucket. When several lines share a bucket, output the computed SUM as a single JSON number —

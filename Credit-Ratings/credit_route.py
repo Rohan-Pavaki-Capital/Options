@@ -39,7 +39,7 @@ import re
 
 from fastapi import APIRouter, HTTPException, Query
 
-router = APIRouter()
+router = APIRouter(tags=["Credit Rating"])
 
 # Route the search-engine fetch through Firecrawl (residential IP) so it isn't
 # blocked. Required for this feature — a bare datacenter request gets walled.

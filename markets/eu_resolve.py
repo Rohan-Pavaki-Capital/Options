@@ -60,7 +60,7 @@ _TICKER_MAP = {
     # France (Euronext Paris)
     "MC": "LVMH", "OR": "L'OREAL", "AIR": "AIRBUS", "TTE": "TOTALENERGIES",
     "SAN": "SANOFI", "BNP": "BNP PARIBAS", "SU": "SCHNEIDER ELECTRIC",
-    "AI": "AIR LIQUIDE", "DG": "VINCI", "KER": "KERING",
+    "AI": "AIR LIQUIDE", "DG": "VINCI", "KER": "KERING", "FGR": "EIFFAGE",
     # Netherlands (Euronext Amsterdam)
     "ASML": "ASML", "HEIA": "HEINEKEN", "PHIA": "KONINKLIJKE PHILIPS",
     "INGA": "ING GROEP", "AD": "KONINKLIJKE AHOLD DELHAIZE", "PRX": "PROSUS",
@@ -124,11 +124,24 @@ def _name_search(query: str, limit: int = 25) -> list[dict[str, str]]:
     return out
 
 
+# Trailing legal-form suffix on a company name ("Eiffage SA", "Enel SpA",
+# "Siemens AG"). filings.xbrl.org / GLEIF often register the name WITHOUT it
+# (Eiffage is stored as plain "EIFFAGE"), so a suffix-stripped variant is
+# tried LAST — after the as-typed spelling, so registered names that DO keep
+# the suffix ("SAP SE") still match first.
+_LEGAL_SUFFIX_RE = re.compile(
+    r"\s+(s\.?a\.?s?|s\.?e\.?|a\.?g\.?|n\.?v\.?|b\.?v\.?|s\.?p\.?a\.?|plc"
+    r"|asa|ab|a/s|oyj|oy|gmbh|kgaa|sca|sa/nv)\.?\s*$",
+    re.IGNORECASE,
+)
+
+
 def _query_variants(q: str) -> list[str]:
     """Spelling variants for the ilike name search, tried in order: as typed;
     accents folded (é→e — ESEF registers many names unaccented, e.g. L'Oréal
     is stored as "L'OREAL"); punctuation replaced by the single-char SQL
-    wildcard '_' (apostrophe/hyphen differences)."""
+    wildcard '_' (apostrophe/hyphen differences); finally the legal-form
+    suffix stripped ("Eiffage SA" → "Eiffage")."""
     out = [q]
     folded = unicodedata.normalize("NFKD", q)
     folded = "".join(c for c in folded if not unicodedata.combining(c))
@@ -137,6 +150,13 @@ def _query_variants(q: str) -> list[str]:
     wild = re.sub(r"[^0-9A-Za-z%\s]", "_", folded)
     if wild not in out:
         out.append(wild)
+    stripped = _LEGAL_SUFFIX_RE.sub("", folded).strip()
+    if len(stripped) >= 3 and stripped != folded:
+        if stripped not in out:
+            out.append(stripped)
+        wild_stripped = re.sub(r"[^0-9A-Za-z%\s]", "_", stripped)
+        if wild_stripped not in out:
+            out.append(wild_stripped)
     return out
 
 
@@ -293,9 +313,16 @@ def resolve_company_number(
             break
 
     # 5) Last resort: GLEIF name → LEI (then confirm it has ESEF filings).
+    # Tried in the same spelling variants as the ilike search (minus the
+    # '_'-wildcarded ones — that wildcard is SQL-ilike-specific), so a
+    # suffixed name ("Eiffage SA") still reaches the registered "EIFFAGE".
     if not candidates:
-        hit = gleif.name_to_lei(company_name or ticker)
-        if hit:
+        for q in _query_variants(company_name or ticker):
+            if "_" in q:
+                continue
+            hit = gleif.name_to_lei(q)
+            if not hit:
+                continue
             lei, name = hit
             count, ctry = _entity_has_filings(lei)
             if count > 0:

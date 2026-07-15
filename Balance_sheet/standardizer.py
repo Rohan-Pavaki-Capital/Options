@@ -12,6 +12,7 @@ import copy
 import json
 import logging
 import re
+import unicodedata
 
 from openai import OpenAI
 
@@ -97,7 +98,11 @@ Keep these OUT of every bucket above; they exist only so the totals reconcile:
    other_liabilities or any non-current bucket. Counting it in both breaks the liability tally.
 
 ## CORE RULES
-- Use ONLY the most-recent period column. Copy numbers exactly (strip only "$" and commas);
+- Use ONLY the most-recent period column. Column order varies: most filings print the most
+  recent period FIRST, but some print the OLDEST first (header "31-12-2024 | 31-12-2025") —
+  the most-recent column is the one under the LATEST date, wherever it sits. A "Notes" column
+  of note references may sit between the label and the values; note references are NEVER
+  values. Copy numbers exactly (strip only "$" and commas);
   negatives stay negative. Never invent a number — every value is a printed line value, or the
   arithmetic SUM of printed line values when several lines share one bucket. When several lines
   share a bucket, output the computed SUM as a single JSON number — never an expression string.
@@ -157,22 +162,67 @@ Return the JSON now.
 
 
 _CELL_NUM_RE = re.compile(r"-?\d{1,3}(?:,\d{3})*(?:\.\d+)?")
+# French number format: spaces as digit-group separators, comma as the decimal
+# mark ("2 099", "37 825", "1 013,5"). Tried only when the US format misses.
+_CELL_NUM_FR_RE = re.compile(r"-?\d{1,3}(?: \d{3})+(?:,\d+)?|-?\d+,\d+")
 
 # Placeholder a filing prints for a zero/nil value in a column.
 _DASH_CELLS = {"—", "–", "-", "--"}
 
+# Year token inside a table cell — a row with two or more year-bearing cells
+# is the date header ("| | 31-12-2024 | 31-12-2025 |") that names the value
+# columns and their order.
+_YEAR_CELL_RE = re.compile(r"\b20\d{2}\b")
+
+
+def _parse_cell(cell: str):
+    """Parse one markdown table cell: a float/int value, 0 for a printed
+    dash, or None when the cell is not a value (label text, note refs like
+    "3, 9, 10", empty)."""
+    raw = (cell.strip("* ").replace("$", "").replace("€", "")
+           .replace(" ", " ").replace(" ", " ").strip())
+    if raw in _DASH_CELLS:
+        return 0
+    negative = raw.startswith("(") and raw.endswith(")")
+    raw = raw.strip("()").strip()
+    value = None
+    if _CELL_NUM_RE.fullmatch(raw):
+        value = float(raw.replace(",", ""))
+    elif _CELL_NUM_FR_RE.fullmatch(raw):
+        # French format: strip the space group separators, comma
+        # becomes the decimal point ("2 099" -> 2099, "1 013,5").
+        value = float(raw.replace(" ", "").replace(",", "."))
+    if value is None:
+        return None
+    if negative:
+        value = -value
+    return int(value) if value == int(value) else value
+
+
+def _fold_label(text: str) -> str:
+    """Accent-folded lowercase for section/keyword matching only — the label
+    shown to the LLM keeps its original spelling. Mirrors pdf_locator._fold."""
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return text.replace("’", "'").lower()
+
 
 # Section keywords for tagging line items with the side they sit under.
-# Order matters: "LIABILITIES AND EQUITY" headers must tag as LIABILITY.
-_SECTION_TERMS = (("liabilit", "LIABILITY"), ("equity", "EQUITY"), ("asset", "ASSET"))
+# Order matters: "LIABILITIES AND EQUITY" / "Capitaux propres et passifs"
+# headers must tag as LIABILITY (liability terms first), and the equity terms
+# must run before the asset terms.
+_SECTION_TERMS = (("liabilit", "LIABILITY"), ("passif", "LIABILITY"),
+                  ("equity", "EQUITY"), ("capitaux propres", "EQUITY"),
+                  ("asset", "ASSET"), ("actif", "ASSET"))
 
 
 def _update_section(text: str, section: str, cnc: str) -> tuple[str, str]:
     """Advance the (side, current/non-current) state from a header line.
-    Loose, case-insensitive substring matching. A side change resets the
-    current/non-current state so a stale tag never leaks across statements;
-    when no header decides it, cnc stays "" (unknown) — never force a tag."""
-    lowered = text.lower()
+    Loose, case-insensitive, accent-folded substring matching (English and
+    French section wording). A side change resets the current/non-current
+    state so a stale tag never leaks across statements; when no header
+    decides it, cnc stays "" (unknown) — never force a tag."""
+    lowered = _fold_label(text)
     new_section = section
     for term, tag in _SECTION_TERMS:
         if term in lowered:
@@ -181,10 +231,14 @@ def _update_section(text: str, section: str, cnc: str) -> tuple[str, str]:
     if new_section != section:
         cnc = ""
     # "non-current ..." headers contain "current asset(s)"/"current liabilit..."
-    # as substrings, so the non-current check must run first.
-    if "non-current" in lowered or "noncurrent" in lowered or "non current" in lowered:
+    # as substrings, so the non-current check must run first. French: "ACTIF
+    # NON COURANT" / "PASSIF NON COURANT" vs "ACTIF COURANT" / "PASSIF COURANT".
+    if ("non-current" in lowered or "noncurrent" in lowered
+            or "non current" in lowered or "non courant" in lowered):
         cnc = "non_current"
-    elif "current asset" in lowered or "current liabilit" in lowered:
+    elif ("current asset" in lowered or "current liabilit" in lowered
+          or "actif courant" in lowered or "actifs courants" in lowered
+          or "passif courant" in lowered or "passifs courants" in lowered):
         cnc = "current"
     return new_section, cnc
 
@@ -206,6 +260,12 @@ def extract_line_items(markdown: str) -> list[tuple[str, float]]:
     items = []
     section = ""
     cnc = ""  # "current" / "non_current" / "" (unknown)
+    # Value-column layout, learned from the table's date header row: how many
+    # dated value columns there are and which of them (0-based, left to
+    # right) holds the MOST RECENT period. Until a date header is seen the
+    # legacy rule applies (first numeric cell = most-recent column).
+    n_value_cols = 0
+    recent_pos = 0
     for line in markdown.splitlines():
         stripped = line.strip()
         if not stripped.startswith("|"):
@@ -215,6 +275,17 @@ def extract_line_items(markdown: str) -> list[tuple[str, float]]:
             continue
         cells = [c.strip() for c in stripped.strip("|").split("|")]
         if len(cells) < 2:
+            continue
+        # Date header row ("| | Notes | 31-12-2024 | 31-12-2025 |"): two or
+        # more year-bearing cells name the value columns. Their order decides
+        # which value each data row contributes — NOS prints OLDEST-first, so
+        # "first numeric cell" would read the prior year (and its Notes
+        # column would poison the checklist with note references first).
+        year_cells = [_YEAR_CELL_RE.search(c) for c in cells]
+        years = [int(m.group(0)) for m in year_cells if m]
+        if len(years) >= 2:
+            n_value_cols = len(years)
+            recent_pos = years.index(max(years))
             continue
         label = cells[0].strip("* ").strip()
         if not label:
@@ -233,23 +304,23 @@ def extract_line_items(markdown: str) -> list[tuple[str, float]]:
         display = f"[{section}] {label}" if section else label
         if cnc and section != "EQUITY":
             display += " (current)" if cnc == "current" else " (non-current)"
-        for cell in cells[1:]:
-            raw = cell.strip("* ").replace("$", "").strip()
-            if raw in _DASH_CELLS:
-                # Most-recent column prints a dash = zero. Stop here — falling
-                # through would read the PRIOR-period column (e.g. NIKE
-                # "Notes payable | — | 5" must be 0, not 5).
-                items.append((display, 0))
-                break
-            negative = raw.startswith("(") and raw.endswith(")")
-            raw = raw.strip("()").strip()
-            m = _CELL_NUM_RE.fullmatch(raw)
-            if m:
-                value = float(raw.replace(",", ""))
-                if negative:
-                    value = -value
-                items.append((display, int(value) if value == int(value) else value))
-                break  # first numeric/dash cell = most-recent column
+        # Every value-like cell in the row (numbers and printed dashes = 0),
+        # left to right. Dashes count so "Notes payable | — | 5" keeps the
+        # most-recent 0, not the prior-period 5 (NIKE).
+        parsed = [v for cell in cells[1:]
+                  if (v := _parse_cell(cell)) is not None]
+        if parsed:
+            if n_value_cols and len(parsed) >= n_value_cols:
+                # The LAST n_value_cols value cells sit under the date
+                # header; anything before them (a Notes column of note
+                # references, e.g. NOS "Borrowings | 25 | 1,306,276 |
+                # 1,357,611") is not a value. Pick the most-recent column.
+                value = parsed[len(parsed) - n_value_cols + recent_pos]
+            else:
+                # No date header seen (or row prints fewer value cells than
+                # the header names): legacy rule, first numeric/dash cell.
+                value = parsed[0]
+            items.append((display, value))
         else:
             # Value-less table row = an in-table section header
             # ("Liabilities:", "Current assets:", "Equity:").

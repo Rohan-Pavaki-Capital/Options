@@ -54,7 +54,7 @@ import re
 
 from fastapi import APIRouter, Query
 
-router = APIRouter()
+router = APIRouter(tags=["Industry"])
 
 GURUFOCUS_API_KEY = os.environ.get("GURUFOCUS_API_KEY", "").strip()
 GURUFOCUS_BASE_URL = os.environ.get(

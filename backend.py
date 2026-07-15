@@ -415,8 +415,8 @@ def _ir_scraper_fetch_annual(out_pdf_path, name, ticker, country, ocr_cb,
     `timeout_sec` wall-clock. Writes the PDF to out_pdf_path and returns the scraper
     info dict on success, else None. A timed-out scraper is abandoned (its orphan
     thread keeps running but only ever writes out_pdf_path, so it cannot race a
-    subsequent fallback that writes a different file). Shared by the EU / Germany /
-    Japan 'IR scraper first' branches (EU itself uses the dual annual+interim path)."""
+    subsequent fallback that writes a different file). Shared by the UK / Germany
+    'IR scraper first' branches (EU and Japan use the dual annual+interim path)."""
     import concurrent.futures
     if not ((name or "").strip() or (ticker or "").strip()):
         return None
@@ -615,34 +615,114 @@ def run_extraction_pipeline(job_id: str):
             _jp_name = (meta.get("company_name") or meta.get("title") or "").strip()
             _jp_ticker = (meta.get("ticker") or "").strip()
 
-            def _ocr_cb_jp(done: int, total: int):
-                if total:
-                    update_job(job_id, progress=2 + int(6 * done / total))
-
             jp_ok = False
-            # Step A: universal IR scraper (annual report only), capped at 100s —
-            # same strategy as the EU tab. Writes its own _ir.pdf so a timed-out
-            # orphan can't race the EDINET fallback PDF.
-            _jp_ir = job_dir / f"{pdf_stem}_ir.pdf"
-            _jp_info = _ir_scraper_fetch_annual(_jp_ir, _jp_name, _jp_ticker,
-                                                "Japan", _ocr_cb_jp)
-            if _jp_info:
-                JOBS[job_id]["filename"] = _jp_ir.name
-                pdf_path = _jp_ir
-                pdf_stem = _jp_ir.stem
+            # Step A: universal IR scraper FIRST, capped at 100s — the SAME dual
+            # annual+interim crawl the EU tab / balance-sheet flow uses
+            # (ir_resolve_proto + ir_fetch_proto.fetch_reports). One IR-page crawl
+            # captures BOTH the latest annual report AND the latest recent
+            # interim/quarterly report:
+            #   - annual found        -> run the annual; keep the interim as a fallback
+            #                            the user can opt into if the annual has no data.
+            #   - only interim found  -> run the interim directly (no annual to prefer).
+            #   - nothing within 100s -> abandon the scraper (its orphan thread only
+            #                            writes its own _annual/_interim PDFs, never the
+            #                            EDINET/pipeline PDF) and fall through to EDINET.
+            if _jp_name or _jp_ticker:
+                import concurrent.futures
+                _annual_pdf = job_dir / f"{pdf_stem}_annual.pdf"
+                _interim_pdf = job_dir / f"{pdf_stem}_interim.pdf"
+
+                # fetch_reports records the annual into this sink the MOMENT it
+                # passes the gate (and saves the PDF right then) — so a 100s cap
+                # that expires during the bonus interim probing can be salvaged
+                # instead of discarding an annual that was already found.
+                _sink: dict = {}
+
+                def _jp_scrape_both():
+                    from prototypes import ir_resolve_proto as _R
+                    from prototypes import ir_fetch_proto as _F
+                    _res = _R.resolve(_jp_name or "", _jp_ticker or "", "",
+                                      "Japan")
+                    _url = _res.get("chosen_url")
+                    if not _url:
+                        raise RuntimeError("IR-scraper: could not resolve an IR site")
+                    _sink["ir_url"] = _url
+                    _out = _F.fetch_reports(
+                        _url, allow_fc=True,
+                        annual_path=str(_annual_pdf), interim_path=str(_interim_pdf),
+                        name=_jp_name or "", early_sink=_sink)
+                    _out["ir_url"] = _url
+                    _out["resolver_confidence"] = _res.get("confidence")
+                    return _out
+
+                _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                _r = None
                 try:
-                    JOBS[job_id]["file_size"] = pdf_path.stat().st_size
+                    _scr = _ex.submit(_jp_scrape_both)
+                    _r = _scr.result(timeout=EU_IR_SCRAPER_TIMEOUT_SEC)
+                except concurrent.futures.TimeoutError:
+                    # Scraper over the cap — salvage the early-saved annual if
+                    # the crawl had already secured one (Kawasaki: the 73pp
+                    # annual passed, then 3 interim probes blew the budget).
+                    # No interim fallback in that case.
+                    if _sink.get("annual"):
+                        _r = {"annual": _sink["annual"], "interim": None,
+                              "ir_url": _sink.get("ir_url")}
                 except Exception:
-                    pass
-                meta = {**meta, **_jp_info,
-                        "company": _jp_name or meta.get("company_name"),
-                        "jp_path": "ir_scraper", "form": "Annual Report"}
-                JOBS[job_id]["source_meta"] = meta
-                _mark_stage(job_id, "jp_fetch",
+                    pass  # scraper failed; fall back to EDINET
+                finally:
+                    # Do NOT wait — a timed-out scraper keeps running in its own
+                    # thread but only ever writes its _annual/_interim PDFs (the
+                    # early-saved annual is never rewritten), so it can't race
+                    # the EDINET/pipeline PDF.
+                    _ex.shutdown(wait=False)
+
+                if _r:
+                    _ann = (_r or {}).get("annual")
+                    _intm = (_r or {}).get("interim")
+
+                    # Pick the primary doc: prefer the annual; else the interim.
+                    _primary = None        # (path, kind, fiscal_year)
+                    _alt = None            # interim kept as the opt-in fallback
+                    if _ann and _annual_pdf.exists() and _annual_pdf.stat().st_size > 0:
+                        _primary = (_annual_pdf, "annual", _ann.get("fiscal_year"))
+                        if _intm and _interim_pdf.exists() and _interim_pdf.stat().st_size > 0:
+                            _alt = (_interim_pdf, "interim", _intm.get("fiscal_year"))
+                    elif _intm and _interim_pdf.exists() and _interim_pdf.stat().st_size > 0:
+                        _primary = (_interim_pdf, "interim", _intm.get("fiscal_year"))
+
+                    if _primary:
+                        _ppath, _pkind, _pyear = _primary
+                        JOBS[job_id]["filename"] = _ppath.name
+                        pdf_path = _ppath
+                        pdf_stem = _ppath.stem
+                        try:
+                            JOBS[job_id]["file_size"] = pdf_path.stat().st_size
+                        except Exception:
+                            pass
+                        meta = {
+                            **meta,
+                            "company": _jp_name or meta.get("company_name"),
+                            "jp_path": "ir_scraper",
+                            "ir_url": (_r or {}).get("ir_url"),
+                            "form": ("Annual Report" if _pkind == "annual"
+                                     else "Interim/Quarterly Report"),
+                            "report_period": _pyear,
+                            "report_year": _pyear,
+                        }
+                        if _alt:
+                            _apath, _akind, _ayear = _alt
+                            meta["alt_report_path"] = str(_apath)
+                            meta["alt_report_kind"] = _akind
+                            meta["alt_report_year"] = _ayear
+                        JOBS[job_id]["source_meta"] = meta
+                        _mark_stage(
+                            job_id, "jp_fetch",
                             duration=time.time() - stage_start, cost=0,
-                            details=(f"{meta.get('company','?')} · IR scraper · "
-                                     f"{_jp_info.get('ir_url','?')}"))
-                jp_ok = True
+                            details=(f"{meta.get('company', '?')} · IR scraper · "
+                                     f"{meta['form']}"
+                                     + (" (+interim available)" if _alt else "")))
+                        jp_ok = True
 
             # Step B: EDINET fallback — only when an EDINET_API_KEY is configured
             # (EDINET's listing + PDF download both need it) AND an EDINET code was
@@ -1949,9 +2029,9 @@ def run_extraction_pipeline(job_id: str):
     except Exception as e:
         traceback.print_exc()
         code, ctx = classify_failure(JOBS.get(job_id, {}), e)
-        # EU tab: if the annual report had no option data but the scraper also saved a
-        # recent interim/quarterly, advertise it so the frontend can offer a retry.
-        # Only EU jobs ever set `alt_report_path`, so this stays naturally EU-scoped.
+        # EU / Japan tabs: if the annual report had no option data but the scraper also
+        # saved a recent interim/quarterly, advertise it so the frontend can offer a
+        # retry. Only the IR-scraper paths (EU, Japan) ever set `alt_report_path`.
         extra: dict = {}
         _m = (JOBS.get(job_id, {}).get("source_meta") or {})
         _alt = _m.get("alt_report_path")
@@ -2074,10 +2154,59 @@ def _pdf_page_count(pdf_path: Path) -> int:
 # FASTAPI APP
 # ═════════════════════════════════════════════════════════════════════
 
+# Section order + description for the /docs (Swagger) page. Every endpoint
+# carries one of these tags; routers mounted at the bottom of this file
+# (XBRL, Simply Wall St, Industry, Credit Rating) tag themselves.
+_OPENAPI_TAGS = [
+    {"name": "Extraction — Upload & Unified",
+     "description": "Upload a PDF or run the unified ticker → extraction "
+                    "pipeline; Excel-ready options output."},
+    {"name": "Markets — US (EDGAR)",
+     "description": "US-listed companies via SEC EDGAR filings."},
+    {"name": "Markets — Europe",
+     "description": "UK (Companies House), EU/EEA (ESEF), Germany, Denmark, "
+                    "plus the EU search / GuruFocus resolve helpers."},
+    {"name": "Markets — Asia",
+     "description": "Japan, Korea, China, Hong Kong, Taiwan, India, Singapore, "
+                    "Indonesia, Malaysia, Thailand, Israel."},
+    {"name": "Markets — Americas",
+     "description": "Canada (SEC MJDS), Brazil (CVM), Mexico."},
+    {"name": "Diamond — Any Market",
+     "description": "Flagship any-market route: dedicated country integration "
+                    "→ EDGAR → universal IR scraper; plus the scraper-only "
+                    "testing route."},
+    {"name": "Filings & Reports",
+     "description": "Fetch the latest filing PDF for any market, or archive "
+                    "all recent IR reports for a company."},
+    {"name": "Balance Sheet",
+     "description": "Standardize a filing's balance sheet and download it as "
+                    "Excel."},
+    {"name": "Analyst Comment",
+     "description": "Generate the analyst Comments note for a company's most "
+                    "recent reported quarter."},
+    {"name": "XBRL",
+     "description": "US options data straight from SEC XBRL facts (no PDF, "
+                    "no LLM) — comparison prototype."},
+    {"name": "Simply Wall St",
+     "description": "Simply Wall St forecast data (standalone feature)."},
+    {"name": "Industry",
+     "description": "Ticker → Damodaran industry via GuruFocus (standalone "
+                    "feature)."},
+    {"name": "Credit Rating",
+     "description": "Company → mapped credit rating via Firecrawl (standalone "
+                    "feature)."},
+    {"name": "Jobs & Downloads",
+     "description": "Poll job status, fetch results, download Excel/PDF, "
+                    "cancel jobs."},
+    {"name": "System",
+     "description": "Health check."},
+]
+
 app = FastAPI(
     title="Pavaki Options Extractor API",
     description="Extract share-based compensation data from annual reports",
     version="1.0.0",
+    openapi_tags=_OPENAPI_TAGS,
 )
 
 _default_origins = [
@@ -2101,12 +2230,12 @@ app.add_middleware(
 )
 
 
-@app.get("/api/health", include_in_schema=False)
+@app.get("/api/health", tags=["System"])
 async def health():
     return {"status": "healthy", "active_jobs": len(JOBS)}
 
 
-@app.post("/api/extract")
+@app.post("/api/extract", tags=["Extraction — Upload & Unified"])
 async def extract_pdf(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
@@ -2149,7 +2278,7 @@ class CommentRequest(BaseModel):
     financials: Optional[Dict[str, Any]] = None
 
 
-@app.post("/api/comment")
+@app.post("/api/comment", tags=["Analyst Comment"])
 def company_comment(payload: CommentRequest):
     """Generate the analyst Comments note for a company.
 
@@ -2192,7 +2321,7 @@ class EdgarExtractRequest(BaseModel):
     form: str = "10-K"
 
 
-@app.post("/api/extract-from-edgar")
+@app.post("/api/extract-from-edgar", tags=["Markets — US (EDGAR)"])
 async def extract_from_edgar(
     payload: EdgarExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2237,7 +2366,7 @@ class DiamondExtractRequest(BaseModel):
     country: Optional[str] = ""
 
 
-@app.post("/api/extract-from-diamond", include_in_schema=False)
+@app.post("/api/extract-from-diamond", tags=["Diamond — Any Market"])
 async def extract_from_diamond(
     payload: DiamondExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2286,7 +2415,7 @@ class SingaporeExtractRequest(BaseModel):
     category: Optional[str] = "annual"
 
 
-@app.post("/api/extract-from-singapore", include_in_schema=False)
+@app.post("/api/extract-from-singapore", tags=["Markets — Asia"])
 async def extract_from_singapore(
     payload: SingaporeExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2346,7 +2475,7 @@ class MexicoExtractRequest(BaseModel):
     category: Optional[str] = "annual"
 
 
-@app.post("/api/extract-from-mexico", include_in_schema=False)
+@app.post("/api/extract-from-mexico", tags=["Markets — Americas"])
 async def extract_from_mexico(
     payload: MexicoExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2406,7 +2535,7 @@ class ScrapeTestRequest(BaseModel):
     category: Optional[str] = "annual"
 
 
-@app.post("/api/scrape-test", include_in_schema=False)
+@app.post("/api/scrape-test", tags=["Diamond — Any Market"])
 async def scrape_test(
     payload: ScrapeTestRequest,
     background_tasks: BackgroundTasks,
@@ -2453,7 +2582,7 @@ class UkExtractRequest(BaseModel):
     category: str = "accounts"
 
 
-@app.post("/api/extract-from-uk", include_in_schema=False)
+@app.post("/api/extract-from-uk", tags=["Markets — Europe"])
 async def extract_from_uk(
     payload: UkExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2519,7 +2648,7 @@ class DkExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-denmark", include_in_schema=False)
+@app.post("/api/extract-from-denmark", tags=["Markets — Europe"])
 async def extract_from_denmark(
     payload: DkExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2584,7 +2713,7 @@ class JpExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-japan", include_in_schema=False)
+@app.post("/api/extract-from-japan", tags=["Markets — Asia"])
 async def extract_from_japan(
     payload: JpExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2649,7 +2778,7 @@ class KrExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-korea", include_in_schema=False)
+@app.post("/api/extract-from-korea", tags=["Markets — Asia"])
 async def extract_from_korea(
     payload: KrExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2703,7 +2832,7 @@ class BrExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-brazil", include_in_schema=False)
+@app.post("/api/extract-from-brazil", tags=["Markets — Americas"])
 async def extract_from_brazil(
     payload: BrExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2755,7 +2884,7 @@ class TwExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-taiwan", include_in_schema=False)
+@app.post("/api/extract-from-taiwan", tags=["Markets — Asia"])
 async def extract_from_taiwan(
     payload: TwExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2804,7 +2933,7 @@ class CnExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-china", include_in_schema=False)
+@app.post("/api/extract-from-china", tags=["Markets — Asia"])
 async def extract_from_china(
     payload: CnExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2853,7 +2982,7 @@ class InExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-india", include_in_schema=False)
+@app.post("/api/extract-from-india", tags=["Markets — Asia"])
 async def extract_from_india(
     payload: InExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2902,7 +3031,7 @@ class HkExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-hongkong", include_in_schema=False)
+@app.post("/api/extract-from-hongkong", tags=["Markets — Asia"])
 async def extract_from_hongkong(
     payload: HkExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2951,7 +3080,7 @@ class IdExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-indonesia", include_in_schema=False)
+@app.post("/api/extract-from-indonesia", tags=["Markets — Asia"])
 async def extract_from_indonesia(
     payload: IdExtractRequest,
     background_tasks: BackgroundTasks,
@@ -2996,7 +3125,7 @@ class IlExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-israel", include_in_schema=False)
+@app.post("/api/extract-from-israel", tags=["Markets — Asia"])
 async def extract_from_israel(
     payload: IlExtractRequest,
     background_tasks: BackgroundTasks,
@@ -3047,7 +3176,7 @@ class MyExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-malaysia", include_in_schema=False)
+@app.post("/api/extract-from-malaysia", tags=["Markets — Asia"])
 async def extract_from_malaysia(
     payload: MyExtractRequest,
     background_tasks: BackgroundTasks,
@@ -3082,7 +3211,7 @@ class ThExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-thailand", include_in_schema=False)
+@app.post("/api/extract-from-thailand", tags=["Markets — Asia"])
 async def extract_from_thailand(
     payload: ThExtractRequest,
     background_tasks: BackgroundTasks,
@@ -3122,7 +3251,7 @@ class EuExtractRequest(BaseModel):
     isin: Optional[str] = None
 
 
-@app.get("/api/eu-search", include_in_schema=False)
+@app.get("/api/eu-search", tags=["Markets — Europe"])
 async def eu_search(q: str, limit: int = 10):
     """Autocomplete for the EU/EEA (ESEF) tab. Returns companies that actually
     have a downloadable ESEF report on filings.xbrl.org whose name matches `q`,
@@ -3137,7 +3266,7 @@ async def eu_search(q: str, limit: int = 10):
     return {"query": query, "results": results}
 
 
-@app.get("/api/gurufocus-resolve", include_in_schema=False)
+@app.get("/api/gurufocus-resolve", tags=["Markets — Europe"])
 async def gurufocus_resolve(url: str):
     """EU tab: turn a GuruFocus stock URL (e.g.
     https://www.gurufocus.com/stock/OSL:AUSS/summary) into the pipeline inputs —
@@ -3153,7 +3282,7 @@ async def gurufocus_resolve(url: str):
         raise HTTPException(status_code=502, detail=f"GuruFocus resolve failed: {e}")
 
 
-@app.post("/api/extract-from-eu", include_in_schema=False)
+@app.post("/api/extract-from-eu", tags=["Markets — Europe"])
 async def extract_from_eu(
     payload: EuExtractRequest,
     background_tasks: BackgroundTasks,
@@ -3214,7 +3343,7 @@ async def extract_from_eu(
     }
 
 
-@app.post("/api/eu-try-alternate/{job_id}", include_in_schema=False)
+@app.post("/api/eu-try-alternate/{job_id}", tags=["Markets — Europe"])
 async def eu_try_alternate(job_id: str, background_tasks: BackgroundTasks):
     """EU tab only: re-run extraction on the interim/quarterly report the scraper
     already downloaded for `job_id`, when its annual report had no option data
@@ -3270,7 +3399,7 @@ class GermanyExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-germany", include_in_schema=False)
+@app.post("/api/extract-from-germany", tags=["Markets — Europe"])
 async def extract_from_germany(
     payload: GermanyExtractRequest,
     background_tasks: BackgroundTasks,
@@ -3320,7 +3449,7 @@ class CaExtractRequest(BaseModel):
     category: str = "annual"
 
 
-@app.post("/api/extract-from-canada", include_in_schema=False)
+@app.post("/api/extract-from-canada", tags=["Markets — Americas"])
 async def extract_from_canada(
     payload: CaExtractRequest,
     background_tasks: BackgroundTasks,
@@ -3458,13 +3587,110 @@ _TICKER_EXCHANGE_PREFIX_TO_COUNTRY = {
 }
 
 
-def _normalize_ticker_and_country(ticker, country):
+# ── US cross-listing detection (SEC official ticker map) ────────────────
+# EU/EEA exchanges cross-list US SEC filers — e.g. Borsa Italiana's Global
+# Equity Market lists Republic Services as "1RSG" (the segment's convention
+# is "1" + the US ticker). Those companies file 10-Ks with the SEC and never
+# file ESEF annual reports, so routing them to the "eu" source can only fail
+# with NO_REPORT. On an EU-routed request, check the ticker against SEC's
+# official ticker map and, on a confident match, redirect to the US ticker +
+# United States so the request flows through EDGAR like a native US one.
+
+_SEC_TICKER_MAP_URL = "https://www.sec.gov/files/company_tickers.json"
+_SEC_TICKER_MAP: Dict[str, Any] = {"map": {}, "ts": 0.0}
+_SEC_TICKER_MAP_TTL = 24 * 3600      # refresh daily
+_SEC_TICKER_MAP_RETRY = 15 * 60      # back off after a failed download
+
+
+def _sec_ticker_map() -> Dict[str, str]:
+    """{"RSG": "Republic Services, Inc.", ...} from SEC's official ticker
+    map, cached in-process for 24h. Returns {} (retried after 15 min) when
+    the download fails — callers treat that as "no match", so an SEC outage
+    can never break EU routing."""
+    now = time.time()
+    if _SEC_TICKER_MAP["ts"] and now - _SEC_TICKER_MAP["ts"] < (
+            _SEC_TICKER_MAP_TTL if _SEC_TICKER_MAP["map"]
+            else _SEC_TICKER_MAP_RETRY):
+        return _SEC_TICKER_MAP["map"]
+    try:
+        import urllib.request
+        ua = (os.environ.get("EDGAR_IDENTITY")
+              or os.environ.get("SEC_USER_AGENT")
+              or "Pavaki Options Extractor contact@pavaki.local")
+        req = urllib.request.Request(_SEC_TICKER_MAP_URL,
+                                     headers={"User-Agent": ua})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.load(r)
+        _SEC_TICKER_MAP["map"] = {
+            (v.get("ticker") or "").upper(): (v.get("title") or "")
+            for v in data.values() if v.get("ticker")
+        }
+    except Exception as exc:
+        print(f"[route] SEC ticker map unavailable ({exc}) — US "
+              f"cross-listing check skipped", flush=True)
+    _SEC_TICKER_MAP["ts"] = now
+    return _SEC_TICKER_MAP["map"]
+
+
+# Corporate-suffix words ignored when comparing company names.
+_COMPANY_NAME_NOISE = {
+    "inc", "incorporated", "corp", "corporation", "co", "company", "plc",
+    "ltd", "limited", "holdings", "holding", "group", "the", "sa", "nv",
+    "ag", "spa", "se", "new",
+}
+
+
+def _company_names_match(a: str, b: str) -> bool:
+    """True when one name's meaningful tokens are contained in the other's
+    ("Republic Services, Inc" vs SEC's "Republic Services, Inc.")."""
+    ta = {t for t in re.findall(r"[a-z0-9]+", (a or "").lower())
+          if t not in _COMPANY_NAME_NOISE}
+    tb = {t for t in re.findall(r"[a-z0-9]+", (b or "").lower())
+          if t not in _COMPANY_NAME_NOISE}
+    return bool(ta) and bool(tb) and (ta <= tb or tb <= ta)
+
+
+def _us_sec_crosslisting(ticker, company_name=""):
+    """(us_ticker, sec_title) when an EU-routed ticker is really a US SEC
+    filer cross-listed on an EU exchange; None otherwise. Deliberately
+    conservative — a bare ticker collision alone never redirects:
+      * "1"+<US ticker> (the Borsa Italiana Global Equity Market convention)
+        redirects when the stripped ticker exists in the SEC map, unless a
+        supplied company name contradicts the SEC registrant name;
+      * the raw ticker redirects only when a supplied company name CONFIRMS
+        the SEC registrant name (e.g. "G" is both Assicurazioni Generali on
+        BIT and Genpact on NYSE — the name breaks the tie)."""
+    t = (ticker or "").strip().upper()
+    if not t:
+        return None
+    smap = _sec_ticker_map()
+    if not smap:
+        return None
+    if re.fullmatch(r"1[A-Z][A-Z0-9.\-]*", t):
+        title = smap.get(t[1:])
+        if title and (not company_name
+                      or _company_names_match(company_name, title)):
+            return t[1:], title
+    title = smap.get(t)
+    if title and company_name and _company_names_match(company_name, title):
+        return t, title
+    return None
+
+
+def _normalize_ticker_and_country(ticker, country, company_name=""):
     """Tolerate exchange-prefixed tickers from Excel/GuruFocus-style clients
     (e.g. "LSE:GSK", "NYSE:UHS"): strip the "EXCHANGE:" prefix — EDGAR and the
     other market fetchers reject the colon — and when the prefix names a known
     exchange let it override `country`, since the listing venue is more specific
     than the caller's country field. Unknown prefixes are stripped without
-    touching the country. Returns (ticker, country), both stripped."""
+    touching the country.
+
+    US cross-listings on EU/EEA exchanges (e.g. "BIT:1RSG" = Republic
+    Services) are redirected to the US ticker + United States — the ESEF
+    source can never serve a US SEC filer, so the request routes to EDGAR
+    like a native US one. `company_name`, when supplied, confirms the match.
+
+    Returns (ticker, country), both stripped."""
     ticker = (ticker or "").strip()
     country = (country or "").strip()
     if ":" in ticker:
@@ -3474,6 +3700,14 @@ def _normalize_ticker_and_country(ticker, country):
             ticker = rest.strip()
         if mapped:
             country = mapped
+    if country.lower() in _OPTIONS_EU_COUNTRIES:
+        us = _us_sec_crosslisting(ticker, company_name)
+        if us:
+            us_ticker, title = us
+            print(f"[route] {ticker!r} ({country}) is US SEC filer "
+                  f"{title!r} — rerouting to EDGAR as {us_ticker!r}",
+                  flush=True)
+            ticker, country = us_ticker, "United States"
     return ticker, country
 
 
@@ -3506,7 +3740,9 @@ def _route_options_request(payload, edgar_default_form: str = "10-K"):
     `edgar_default_form` is the US form used when the payload gives none:
     "10-K" for the extraction endpoints; the fetch-filing endpoint passes
     "LATEST" (newest of 10-K/10-Q, resolved in edgar_fetch)."""
-    ticker, country = _normalize_ticker_and_country(payload.ticker, payload.country)
+    ticker, country = _normalize_ticker_and_country(
+        payload.ticker, payload.country, payload.company_name
+    )
     company_name = (payload.company_name or "").strip()
     if not country:
         raise HTTPException(status_code=400, detail="country is required")
@@ -3578,7 +3814,7 @@ def _route_options_request(payload, edgar_default_form: str = "10-K"):
     return source, handler, Model, kwargs, ticker, company_name, country
 
 
-@app.post("/api/extract-from-options")
+@app.post("/api/extract-from-options", tags=["Extraction — Upload & Unified"])
 async def extract_from_options(payload: OptionsExtractRequest):
     """Single unified endpoint: take {ticker, company_name, country} and route to
     the EXACT existing per-country handler (UK -> Companies House + IR fallback,
@@ -3810,7 +4046,7 @@ async def _fetch_filing_pdf(payload: FetchFilingRequest):
     return job_id, pdf_path, job
 
 
-@app.post("/api/fetch-filing")
+@app.post("/api/fetch-filing", tags=["Filings & Reports"])
 async def fetch_filing(payload: FetchFilingRequest):
     """Single endpoint returning the MOST RECENT filing PDF for a company —
     the PDF file itself, in this one response.
@@ -3850,7 +4086,7 @@ class CollectReportsRequest(BaseModel):
     min_fiscal_year: Optional[int] = None
 
 
-@app.post("/api/reports/collect")
+@app.post("/api/reports/collect", tags=["Filings & Reports"])
 async def collect_reports(payload: CollectReportsRequest):
     """Crawl the company's investor-relations site ONCE and save ALL recent
     annual + quarterly reports into reports/<ticker>/ — one folder, one file
@@ -3966,7 +4202,7 @@ async def _bs_run_job(bs_job_id: str, payload: FetchFilingRequest):
         # from the request (exchange-prefixed tickers override it, same rule
         # as routing).
         _, _bs_country = _normalize_ticker_and_country(
-            payload.ticker, payload.country
+            payload.ticker, payload.country, payload.company_name
         )
         region = ("eu" if (_bs_country or "").strip().lower()
                   in _BS_EU_PROMPT_COUNTRIES else None)
@@ -3976,6 +4212,21 @@ async def _bs_run_job(bs_job_id: str, payload: FetchFilingRequest):
         result = await run_in_threadpool(
             run_balance_sheet, str(pdf_path), region
         )
+
+        # Filing-vintage warning: ESEF coverage on filings.xbrl.org is
+        # partial, so the newest report a source offers can be years old
+        # (e.g. Eiffage = FY2023). Flag it rather than fail — the numbers
+        # themselves are untouched.
+        _meta = (job or {}).get("source_meta") or {}
+        _fy = re.search(r"(?:19|20)\d{2}",
+                        str(_meta.get("report_year")
+                            or _meta.get("report_period") or ""))
+        if (_fy and isinstance(result, dict)
+                and int(_fy.group(0)) < datetime.now().year - 1):
+            result.setdefault("warnings", []).append(
+                f"Filing vintage: FY{_fy.group(0)} — the newest report "
+                f"available from this source for this company."
+            )
 
         # ── Evidence PDF (user request 2026-07-09): save the located
         # balance-sheet pages, highlighted, to HareRam/. Best-effort — the
@@ -4022,7 +4273,7 @@ async def _bs_run_job(bs_job_id: str, payload: FetchFilingRequest):
                               "error_code": "INTERNAL", "created": time.time()}
 
 
-@app.post("/api/balance-sheet/standardize", status_code=202)
+@app.post("/api/balance-sheet/standardize", status_code=202, tags=["Balance Sheet"])
 async def balance_sheet_standardize(payload: FetchFilingRequest):
     """Start a balance-sheet standardization job (same inputs + same
     per-market routing as /api/fetch-filing: {ticker, company_name, country,
@@ -4081,7 +4332,7 @@ async def balance_sheet_standardize(payload: FetchFilingRequest):
                         content={"job_id": bs_job_id, "status": "pending"})
 
 
-@app.get("/api/balance-sheet/status")
+@app.get("/api/balance-sheet/status", tags=["Balance Sheet"])
 async def balance_sheet_status(job_id: str = ""):
     """Poll a balance-sheet standardization job. Pure dict lookup — never does
     any work. Returns pending / done (with the full standardized JSON merged
@@ -4101,7 +4352,7 @@ async def balance_sheet_status(job_id: str = ""):
     return {"job_id": job_id, "status": "pending"}
 
 
-@app.post("/api/balance-sheet/excel")
+@app.post("/api/balance-sheet/excel", tags=["Balance Sheet"])
 async def balance_sheet_excel(payload: FetchFilingRequest):
     """Same workflow as /api/balance-sheet/standardize (same inputs, same
     per-market fetch routing, same Stage 1 page location + Stage 2 LlamaParse)
@@ -4133,7 +4384,7 @@ async def balance_sheet_excel(payload: FetchFilingRequest):
     )
 
 
-@app.get("/api/excel/options")
+@app.get("/api/excel/options", tags=["Extraction — Upload & Unified"])
 async def excel_options(
     ticker: str = "",
     country: str = "",
@@ -4374,7 +4625,7 @@ async def excel_options(
                 "error": f"{type(exc).__name__}: {exc}"}
 
 
-@app.get("/api/job/{job_id}", include_in_schema=False)
+@app.get("/api/job/{job_id}", tags=["Jobs & Downloads"])
 async def get_job_status(job_id: str):
     if job_id not in JOBS:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -4393,7 +4644,7 @@ async def get_job_status(job_id: str):
     return job
 
 
-@app.get("/api/result/{job_id}", include_in_schema=False)
+@app.get("/api/result/{job_id}", tags=["Jobs & Downloads"])
 async def get_result(job_id: str):
     # Like the Excel download: fall back to the on-disk result if the in-memory job
     # record was lost to a backend restart.
@@ -4415,7 +4666,7 @@ async def get_result(job_id: str):
         return json.load(f)
 
 
-@app.get("/api/download/{job_id}/excel", include_in_schema=False)
+@app.get("/api/download/{job_id}/excel", tags=["Jobs & Downloads"])
 async def download_excel(job_id: str):
     # Serve from disk even if the in-memory job record is gone (e.g. the backend was
     # restarted) — the generated workbook persists under jobs/<id>/. Only block the
@@ -4440,7 +4691,7 @@ async def download_excel(job_id: str):
     )
 
 
-@app.get("/api/download/{job_id}/pdf", include_in_schema=False)
+@app.get("/api/download/{job_id}/pdf", tags=["Jobs & Downloads"])
 async def download_pdf(job_id: str):
     """Serve the fetched source PDF (used by the TESTING tab). Served from disk
     so it works even if the in-memory job record was lost to a restart."""
@@ -4473,7 +4724,7 @@ async def download_pdf(job_id: str):
     )
 
 
-@app.delete("/api/job/{job_id}", include_in_schema=False)
+@app.delete("/api/job/{job_id}", tags=["Jobs & Downloads"])
 async def cancel_job(job_id: str):
     if job_id not in JOBS:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -4486,7 +4737,7 @@ async def cancel_job(job_id: str):
     return {"status": "cancelled", "job_id": job_id}
 
 
-@app.get("/api/jobs", include_in_schema=False)
+@app.get("/api/jobs", tags=["Jobs & Downloads"])
 async def list_jobs():
     return {
         "total": len(JOBS),

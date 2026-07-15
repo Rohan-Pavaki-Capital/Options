@@ -14,7 +14,7 @@ Takes a resolved IR-page URL (from ir_resolve_proto.resolve) and:
 Touches nothing in the running app. Firecrawl is opt-in (--firecrawl) to save credits.
 """
 from __future__ import annotations
-import re, sys, io, time
+import re, sys, io, time, unicodedata
 from urllib.parse import urljoin, urlparse, unquote
 import requests
 from bs4 import BeautifulSoup
@@ -60,7 +60,66 @@ SBC_TERMS = [
     # Chinese (Traditional/Simplified): share-based payment / equity incentive / option / vesting
     "股份支付", "股權激勵", "股权激励", "以股份為基礎", "購股權", "认股权", "認股權",
     "限制性股票", "受限制股份", "期權", "归属", "歸屬",
+    # French (official-language IR PDFs, e.g. Eiffage's URD): share-based
+    # payment / stock options / free-share plans. Apostrophe-free spellings —
+    # French PDFs mix ' and ’ so terms with apostrophes would miss.
+    "fondés sur des actions", "fondé sur des actions",
+    "options de souscription", "actions gratuites", "attributions gratuites",
+    "actions de performance",
 ]
+
+# Balance-sheet statement presence probe — a genuine filing carries a page
+# titled like the statement (contiguous title) WITH an assets total on it or the
+# next page; results-presentation decks don't (Kawasaki's deck captions a slide
+# "–Statement of Financial Position-" but never matches the contiguous
+# "Consolidated Statement of ..." variants and so fails Stage 1 downstream).
+# Checking CONTENT here means a mis-scored deck is rejected at the probe instead
+# of failing the pipeline later. Mirrors Balance_sheet Stage 1's title list.
+try:
+    from Balance_sheet.config import TITLE_VARIANTS as _BS_TITLE_VARIANTS
+except Exception:  # standalone run without the Balance_sheet package on path
+    _BS_TITLE_VARIANTS = [
+        "CONDENSED CONSOLIDATED BALANCE SHEET", "CONSOLIDATED BALANCE SHEET",
+        "BALANCE SHEET", "STATEMENTS OF FINANCIAL POSITION",
+        "CONSOLIDATED STATEMENTS OF FINANCIAL POSITION",
+        "CONSOLIDATED STATEMENT OF FINANCIAL POSITION",
+        "BILAN CONSOLIDÉ", "ÉTAT CONSOLIDÉ DE LA SITUATION FINANCIÈRE",
+        "ÉTAT DE LA SITUATION FINANCIÈRE CONSOLIDÉE", "COMPTES CONSOLIDÉS",
+    ]
+# CJK statement titles + assets-total markers (JP/CN/HK-language filings), so
+# the check never rejects a legitimate CJK report the SBC gate accepts.
+_BS_TITLES_CJK = ["資產負債表", "资产负债表", "財務狀況表", "财务状况表",
+                  "貸借対照表", "財政状態計算書"]
+_BS_ASSETS_MARKERS = [
+    "total assets", "total current assets", "total de l'actif", "total actif",
+    "資產總額", "资产总额", "總資產", "总资产", "資產合計", "资产合计", "資産合計",
+]
+
+
+def _fold_text(text: str) -> str:
+    """Lowercase + strip accents + normalize apostrophes — mirrors the Stage-1
+    locator's folding so FR titles match here the same way they will there."""
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return text.replace("’", "'").lower()
+
+
+def _has_balance_sheet_page(doc: "fitz.Document") -> bool:
+    """True when some page carries a balance-sheet / financial-position TITLE
+    and that page (or the next — two-page statements) carries an assets total.
+    Approximates what Stage 1 (pdf_locator.locate_balance_sheet) will accept."""
+    variants = [_fold_text(v) for v in _BS_TITLE_VARIANTS] + _BS_TITLES_CJK
+    n = doc.page_count
+    for i in range(n):
+        text = _fold_text(doc[i].get_text())
+        if not any(v in text for v in variants):
+            continue
+        window = text + ("\n" + _fold_text(doc[i + 1].get_text())
+                         if i + 1 < n else "")
+        if any(m in window for m in _BS_ASSETS_MARKERS):
+            return True
+    return False
+
 
 # POS = doc-type signals. At least one POS hit is REQUIRED (recency/English alone can't win).
 POS = [
@@ -87,6 +146,10 @@ NEG = [
     (r"esg|sustainab|\bcsr\b|climate|carbon|diversity|impact report", 45),
     (r"proxy|circular|\bagm\b|notice of meeting|information statement|voting", 30),
     (r"present|slides|transcript|webcast|fact ?sheet|infographic|fireside", 35),
+    # presentation-material filename prefix (Kawasaki "pre_260512-1e.pdf") — the
+    # anchor may carry no "presentation" wording when the deck is linked from a
+    # listing page, so catch the filename convention too.
+    (r"/pre[-_]\d", 35),
     (r"summary|highlights|press release|news release|\bpr\b|media|alert", 22),
     (r"governance|remuneration report|compensation discussion", 12),
     # HKEX/SEHK periodic regulatory returns — NOT the annual report
@@ -101,6 +164,11 @@ REPORTS_PAGE = [
     (r"annual[- ]?publication", 36), (r"annual[- ]?report", 32),
     (r"annual[- ]?result", 26), (r"financial statement", 30), (r"financial report", 25),
     (r"reports? (and|&) (filing|presentation|document|publication)", 22),
+    # hub-and-spoke IR libraries (Kawasaki): the statements sit behind
+    # "Financial Results" / "Performance / Financial Information" / "IR Library"
+    # sub-pages whose anchors carried no signal under the patterns above.
+    (r"financial[- ]?(?:results?|information)", 24),
+    (r"ir[- ]?library|\blibrary\b", 14),
     (r"financials\b", 20), (r"\bfilings?\b", 16), (r"reports?\b", 10), (r"investor", 6),
 ]
 # steer the crawl AWAY from interim/news pages when picking which sub-page to follow
@@ -273,6 +341,12 @@ def score_pdf(url: str, anchor: str) -> float:
     # GATE: with no doc-type signal, recency/English can't manufacture a winner.
     if pos == 0:
         s = min(s, 5)
+    # GATE: strong NEGATIVE doc-type evidence over a weak positive (a results
+    # PRESENTATION whose only positive hit is an FY token) can't be rescued by
+    # the recency/English bonuses either — Kawasaki's FY2025 slide deck scored
+    # +6 that way (8 pos - 35 present + 8 en + 25 recency) and won the probe.
+    if neg > pos and pos < 20:
+        s = min(s, 0)
     return s
 
 
@@ -293,25 +367,41 @@ def find_report_pdfs(ir_url: str, allow_fc: bool) -> list[tuple[float, str, str]
             add(su, sa)
         return links
 
+    def _page_candidates(page_links):
+        cands = []
+        for u, a in page_links:
+            blob = f"{a} {urlparse(u).path}".lower()
+            ps = sum(w for pat, w in REPORTS_PAGE if re.search(pat, blob))
+            ps -= sum(w for pat, w in REPORTS_PAGE_NEG if re.search(pat, blob))
+            if ps > 0 and urlparse(u).netloc and not re.search(r"\.pdf", u, re.I):
+                cands.append((ps, u, a))
+        cands.sort(reverse=True)
+        return cands
+
     crawled = [ir_url]
     links = crawl_page(ir_url)
 
     # follow the best "reports / financial statements" sub-pages
-    cand_pages = []
-    for u, a in links:
-        blob = f"{a} {urlparse(u).path}".lower()
-        ps = sum(w for pat, w in REPORTS_PAGE if re.search(pat, blob))
-        ps -= sum(w for pat, w in REPORTS_PAGE_NEG if re.search(pat, blob))
-        if ps > 0 and urlparse(u).netloc and not re.search(r"\.pdf", u, re.I):
-            cand_pages.append((ps, u, a))
-    cand_pages.sort(reverse=True)
     seen = {ir_url}
-    for ps, u, a in cand_pages[:3]:
+    level2_links = []
+    for ps, u, a in _page_candidates(links)[:3]:
         if u in seen:
             continue
         seen.add(u)
         crawled.append(u)
         print(f"    -> follow reports page (score {ps}): {u}")
+        level2_links += crawl_page(u)
+
+    # ONE more hop for hub-and-spoke IR libraries (Kawasaki: IR landing ->
+    # "IR Library" -> "Financial Results"): the level-1 pages carry no report
+    # PDFs at all, only better-named sub-pages. Follow the strongest NEW
+    # sub-pages found on them; the >=12 floor skips weak "investor"-grade links.
+    for ps, u, a in [c for c in _page_candidates(level2_links) if c[0] >= 12][:2]:
+        if u in seen:
+            continue
+        seen.add(u)
+        crawled.append(u)
+        print(f"    -> follow reports sub-page (score {ps}): {u}")
         crawl_page(u)
 
     def _assess():
@@ -353,25 +443,50 @@ def find_report_pdfs(ir_url: str, allow_fc: bool) -> list[tuple[float, str, str]
     return ranked
 
 
+def _download_pdf(url: str, referer: str) -> tuple[bytes, str]:
+    """One download attempt (Firecrawl PDF fetch, then plain requests).
+    Returns (bytes, "") on a real PDF, (b"", reason) otherwise."""
+    try:
+        from core import fc_client
+        data = fc_client.fetch_pdf(url, referer=referer)
+        if data[:4] == b"%PDF":
+            return data, ""
+    except Exception:
+        pass
+    try:
+        r = requests.get(url, headers={"User-Agent": UA, "Referer": referer},
+                         timeout=TIMEOUT)
+        if r.content[:4] == b"%PDF":
+            return r.content, ""
+        return b"", (f"not a PDF (HTTP {r.status_code}; likely a "
+                     f"viewer/stateful doc system)")
+    except Exception as e:
+        return b"", f"download failed (bot-walled/opaque): {e!r}"
+
+
 def inspect_pdf(url: str, referer: str, save_path: str | None = None,
                 force_save: bool = False) -> dict:
     """Download + open; report pages, text-layer, and SBC-term hits (Stage-1 stand-in).
     If save_path is given and the bytes are a real PDF, write them to disk."""
-    data = b""
-    try:
-        from core import fc_client
-        data = fc_client.fetch_pdf(url, referer=referer)
-    except Exception as e1:
-        try:
-            r = requests.get(url, headers={"User-Agent": UA, "Referer": referer}, timeout=TIMEOUT)
-            data = r.content if r.content[:4] == b"%PDF" else b""
-        except Exception as e2:
-            return {"ok": False, "reason": f"download failed (bot-walled/opaque): {e2!r}"}
-    if data[:4] != b"%PDF":
-        return {"ok": False, "reason": "not a PDF (likely a viewer/stateful doc system)"}
+    data, why = _download_pdf(url, referer)
+    if not data and "+" in urlparse(url).path:
+        # Jahia/AEM-style CMSes store files with literal spaces (%20); some
+        # crawl/search tiers return the links '+'-encoded, which these servers
+        # 404 (e.g. eiffage.com "Rapport+Annuel/..."). Retry once with %20.
+        data, why2 = _download_pdf(url.replace("+", "%20"), referer)
+        if not data:
+            why = why2
+    if not data:
+        return {"ok": False, "reason": why}
     doc = fitz.open(stream=data, filetype="pdf")
     n = doc.page_count
-    sample = " ".join(doc[i].get_text() for i in range(min(n, 40))).lower()
+    # SBC sampling: the first 40 pages cover a US 10-K, but European URDs run
+    # 400+ pages with the financial statements (and the share-based-payment
+    # note) deep in the document — stride-sample the remainder so they count.
+    sample_pages = list(range(min(n, 40)))
+    if n > 100:
+        sample_pages += list(range(40, n, 5))
+    sample = " ".join(doc[i].get_text() for i in sample_pages).lower()
     hits = sorted({t for t in SBC_TERMS if t in sample})
     # CONTENT-based doc-type check (filename is useless on hash-named/tile IR sites):
     # read the cover and reject interim/quarterly announcements.
@@ -380,13 +495,46 @@ def inspect_pdf(url: str, referer: str, save_path: str | None = None,
         r"three months ended|six months ended|nine months ended|first quarter|"
         r"second quarter|third quarter|interim results|interim report|quarterly|"
         r"unaudited.{0,40}results|中期|季度|第[一二三]季", cover))
+    # "for the (fiscal) year(s) ended": audited multi-year statements title the
+    # cover "For the Years ended March 31, 2026 and 2025" (Kawasaki) and JP
+    # tanshin covers say "for the Fiscal Year Ended" — both are annual filings.
     is_annual = bool(re.search(
-        r"annual report|annual financial|for the year ended|siemens report|"
-        r"integrated report|年度報告|年報|年度报告|年报", cover))
-    # fiscal year from the cover (the prominent year), for "pick the newest" logic
+        r"annual report|annual financial|for the (?:fiscal )?years? ended|siemens report|"
+        r"integrated report|年度報告|年報|年度报告|年报|"
+        # French: "Document d'enregistrement universel" (URD, apostrophe-free
+        # match), "Rapport (financier) annuel", "exercice clos le ..." —
+        # \s+ because cover titles wrap across lines ("d'enregistrement \n
+        # universel").
+        r"enregistrement\s+universel|rapport\s+annuel|"
+        r"rapport\s+financier\s+annuel|exercice\s+clos", cover))
+    # fiscal year from the cover: prefer the year printed WITH the report
+    # title ("Document d'enregistrement universel 2025", "Annual Report
+    # 2025") — covers also carry unrelated later dates (AGM, filing date)
+    # that would win a bare max(); fall back to the prominent max year.
     cover_years = [int(y) for y in re.findall(r"(?<!\d)(?:20)\d{2}(?!\d)", cover)
                    if 2000 <= int(y) <= CURRENT_YEAR + 1]
-    fiscal_year = max(cover_years) if cover_years else None
+    m_title_year = re.search(
+        r"(?:annual\s+report|registration\s+document|enregistrement\s+universel|"
+        r"rapport\s+annuel|rapport\s+financier\s+annuel)[^\d]{0,15}((?:20)\d{2})",
+        cover)
+    if m_title_year and 2000 <= int(m_title_year.group(1)) <= CURRENT_YEAR + 1:
+        fiscal_year = int(m_title_year.group(1))
+    else:
+        fiscal_year = max(cover_years) if cover_years else None
+    if fiscal_year is None:
+        # Cover text unusable — CID-font covers can decode digits to control
+        # chars (Kawasaki's audited CFS prints 2026 as "202\x19") — so fall
+        # back to years printed next to a reporting-period phrase in the
+        # sampled body text, where the statement pages' fonts decode cleanly.
+        # Anchoring to the phrase keeps unrelated years (bond maturities,
+        # subsequent-event dates) from inflating the fiscal year.
+        # non-greedy any-char gap: the day number sits between the phrase and
+        # the year ("as of march 31, 2026"), so a digit-free gap never reaches it.
+        period_years = [int(y) for y in re.findall(
+            r"(?:years?\s+end(?:ed|ing)|as\s+(?:of|at))"
+            r"[\s\S]{0,40}?(?<!\d)((?:20)\d{2})(?!\d)",
+            sample) if 2000 <= int(y) <= CURRENT_YEAR + 1]
+        fiscal_year = max(period_years) if period_years else None
     # gate: a usable filing is LONG, mentions SBC, and is EITHER an annual report (10-K)
     # OR a RECENT (current/last-FY) quarterly/interim report. Per user: not restricted to
     # annual reports — a recent 2026 quarterly (10-Q) is acceptable too. An OLD interim
@@ -397,7 +545,15 @@ def inspect_pdf(url: str, referer: str, save_path: str | None = None,
     # KNOWN year below the floor is rejected (an undatable doc isn't blocked on this rule).
     eff_year = fiscal_year or _year_in(unquote(urlparse(url).path))
     year_ok = (eff_year is None) or (eff_year >= MIN_FISCAL_YEAR)
-    accept = (len(hits) >= 2 and n >= 40 and year_ok
+    # CONTENT doc-type check: a genuine filing has a balance-sheet /
+    # financial-position statement page; presentation decks and summary docs
+    # don't. Only computed once the cheap gates pass (it reads every page);
+    # the >=1-hit / >=20pp floor matches the relaxed interim gate's minimums
+    # so _passes_interim always sees a computed value, not None.
+    has_bs = None
+    if len(hits) >= 1 and n >= 20 and year_ok:
+        has_bs = _has_balance_sheet_page(doc)
+    accept = (len(hits) >= 2 and n >= 40 and year_ok and bool(has_bs)
               and ((not is_interim) or is_annual or recent))
     saved = None
     if save_path and (accept or force_save):  # persist a gate-passing doc (or when forced)
@@ -410,6 +566,8 @@ def inspect_pdf(url: str, referer: str, save_path: str | None = None,
         note = "too short (<40pp)"
     elif not year_ok:
         note = f"too old (FY{eff_year} < {MIN_FISCAL_YEAR})"
+    elif has_bs is False:
+        note = "no balance-sheet statement page (presentation/summary doc?)"
     elif is_interim and not is_annual and not recent:
         note = "interim/quarterly and not recent (older than last FY)"
     else:
@@ -417,11 +575,22 @@ def inspect_pdf(url: str, referer: str, save_path: str | None = None,
     return {"ok": True, "pages": n, "bytes": len(data), "saved": saved,
             "text_layer": len(sample) > 500, "sbc_hits": hits,
             "is_interim": is_interim, "is_annual": is_annual, "fiscal_year": fiscal_year,
+            "has_balance_sheet": has_bs,
             "stage1_would_accept": accept, "gate_note": note}
+
+
+# Public second-level suffixes under 2-letter ccTLDs (co.jp, co.uk, com.br,
+# co.kr, com.hk, ...): the registrable name there is THREE labels — naively
+# taking two returns the bare suffix ("co.jp"), and the search fallback's
+# own-domain filter then matches EVERY company on that suffix (Kawasaki's
+# crawl accepted a kagome.co.jp PDF as its annual report).
+_CC_SLD = {"co", "com", "ne", "net", "or", "org", "ac", "go", "gov", "edu"}
 
 
 def _registrable(host: str) -> str:
     parts = host.lower().split(".")
+    if len(parts) >= 3 and parts[-2] in _CC_SLD and len(parts[-1]) == 2:
+        return ".".join(parts[-3:])
     return ".".join(parts[-2:]) if len(parts) >= 2 else host.lower()
 
 
@@ -455,7 +624,8 @@ def _search_candidate_pdfs(ir_url: str, name: str = "", limit: int = 8) -> list[
                     u = r.get("href") or r.get("url") or ""
                     if not u or u in seen:
                         continue
-                    if reg in urlparse(u).netloc.lower():   # issuer's own domain/CDN only
+                    _h = urlparse(u).netloc.lower()
+                    if _h == reg or _h.endswith("." + reg):   # issuer's own domain/CDN only
                         seen.add(u)
                         urls.append(u)
         except Exception as e:
@@ -478,7 +648,10 @@ def fetch_annual_report(ir_url: str, allow_fc: bool = True, save_path: str | Non
         nonlocal downloads
         info = inspect_pdf(u, ir_url)          # probe only; don't save yet
         downloads += 1
-        tag = info.get("gate_note") or f"FY{info.get('fiscal_year')}"
+        # gate_note (gated), then reason (download/non-PDF failure — without
+        # this those probes all print an opaque "FYNone"), then the FY tag.
+        tag = (info.get("gate_note") or info.get("reason")
+               or f"FY{info.get('fiscal_year')}")
         ok = bool(info.get("ok") and info.get("stage1_would_accept"))
         print(f"    probe{label} {('OK ' + str(info.get('pages')) + 'pp ' + tag) if ok else 'reject: ' + tag}  {u[:80]}")
         if ok:
@@ -519,7 +692,7 @@ def fetch_annual_report(ir_url: str, allow_fc: bool = True, save_path: str | Non
 
 def fetch_reports(ir_url: str, allow_fc: bool = True, annual_path: str | None = None,
                   interim_path: str | None = None, max_downloads: int = 10,
-                  name: str = "") -> dict:
+                  name: str = "", early_sink: dict | None = None) -> dict:
     """Like fetch_annual_report, but captures BOTH the latest annual report AND the
     latest recent interim/quarterly report from the SAME single IR-page crawl. Used by
     the EU tab so that, if the annual report turns out to have no share-based-payment
@@ -532,6 +705,15 @@ def fetch_reports(ir_url: str, allow_fc: bool = True, annual_path: str | None = 
 
     Returns {"annual": {url,fiscal_year,info,path}|None,
              "interim": {url,fiscal_year,info,path}|None, "ir_url": ir_url}.
+
+    `early_sink`: callers run this whole function under a wall-clock cap
+    (backend Stage-0: 100s), and the crawl alone can cost 60-90s — so the
+    annual is SAVED the moment it passes the gate (exactly where
+    fetch_annual_report stops), and recorded into `early_sink["annual"]`.
+    The interim probing that follows is a bonus; if the caller's cap expires
+    during it, the caller can salvage the already-saved annual from the sink
+    instead of discarding a successful fetch (Kawasaki: the 73pp annual
+    passed, then interim probes blew the budget).
     """
     ranked_all = find_report_pdfs(ir_url, allow_fc)
     # Annual candidates: positive-scored (have an annual/FS doc-type signal).
@@ -546,6 +728,26 @@ def fetch_reports(ir_url: str, allow_fc: bool = True, annual_path: str | None = 
 
     passers, downloads, seen, probed = [], 0, set(), {}
     recent = CURRENT_YEAR - 1
+    early_annual: dict | None = None
+
+    def _secure_annual():
+        # Save the newest RECENT annual as soon as one has passed the gate (see
+        # docstring). The early save is authoritative — never rewritten later —
+        # so a caller that salvages the file after its cap expired cannot race
+        # the still-running orphan thread rewriting it.
+        nonlocal early_annual
+        if early_annual is not None or not annual_path:
+            return
+        ra = sorted([p for p in passers if p[1] == 1 and p[0] >= recent],
+                    reverse=True)
+        if not ra:
+            return
+        fy, _a, _p, u, _info = ra[0]
+        info = inspect_pdf(u, ir_url, save_path=annual_path)
+        early_annual = {"url": u, "fiscal_year": fy, "info": info,
+                        "path": annual_path}
+        if early_sink is not None:
+            early_sink["annual"] = early_annual
 
     def _passes_interim(info: dict) -> bool:
         # Relaxed gate for interim / half-year FINANCIAL reports: they are legitimately
@@ -555,7 +757,10 @@ def fetch_reports(ir_url: str, allow_fc: bool = True, annual_path: str | None = 
         return (bool(info.get("ok"))
                 and (info.get("fiscal_year") or 0) >= recent
                 and (info.get("pages") or 0) >= 20
-                and len(info.get("sbc_hits") or []) >= 1)
+                and len(info.get("sbc_hits") or []) >= 1
+                # same content check as the strict gate — a recent 57pp results
+                # DECK satisfies every line above; the statement page doesn't lie.
+                and bool(info.get("has_balance_sheet")))
 
     def _probe(u, label):
         nonlocal downloads
@@ -566,7 +771,10 @@ def fetch_reports(ir_url: str, allow_fc: bool = True, annual_path: str | None = 
         probed[u] = info
         downloads += 1
         ok = bool(info.get("ok") and info.get("stage1_would_accept"))
-        tag = info.get("gate_note") or f"FY{info.get('fiscal_year')}"
+        # gate_note (gated), then reason (download/non-PDF failure — without
+        # this those probes all print an opaque "FYNone"), then the FY tag.
+        tag = (info.get("gate_note") or info.get("reason")
+               or f"FY{info.get('fiscal_year')}")
         print(f"    probe{label} {('OK ' + str(info.get('pages')) + 'pp ' + tag) if ok else 'reject: ' + tag}  {u[:80]}")
         if ok:
             passers.append((info.get("fiscal_year") or 0,
@@ -581,6 +789,7 @@ def fetch_reports(ir_url: str, allow_fc: bool = True, annual_path: str | None = 
         if downloads >= max_downloads:
             break
         _probe(u, f" [{sc:+.0f}]")
+        _secure_annual()
         if any(p[1] == 1 and p[0] >= recent for p in passers):
             if any(p[1] == 0 and p[0] >= recent for p in passers):
                 break                          # already have a recent annual + interim
@@ -619,14 +828,19 @@ def fetch_reports(ir_url: str, allow_fc: bool = True, annual_path: str | None = 
         for u in _search_candidate_pdfs(ir_url, name):
             if downloads >= max_downloads:
                 break
-            if _probe(u, "(search)") and passers[-1][0] >= recent:
+            probed_ok = _probe(u, "(search)")
+            _secure_annual()
+            if probed_ok and passers[-1][0] >= recent:
                 break
 
     annuals = sorted([p for p in passers if p[1] == 1], reverse=True)
     interims = sorted([p for p in passers if p[1] == 0], reverse=True)
 
     out: dict = {"annual": None, "interim": None, "ir_url": ir_url}
-    if annuals and annual_path:
+    if early_annual is not None:
+        # Already saved at pass time — reuse; never rewrite (see _secure_annual).
+        out["annual"] = early_annual
+    elif annuals and annual_path:
         fy, _a, _p, u, info = annuals[0]
         info = inspect_pdf(u, ir_url, save_path=annual_path)
         out["annual"] = {"url": u, "fiscal_year": fy, "info": info, "path": annual_path}

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import urllib.parse
 import urllib.request
 import zipfile
@@ -92,7 +93,29 @@ def _latest_filing(lei: str) -> dict[str, Any]:
         )
 
     best = max(rows, key=key)
-    return best.get("attributes") or {}
+    attrs = best.get("attributes") or {}
+
+    # Freshness floor — same no-stale-data rule as the IR scraper's gate.
+    # The repository's coverage is partial, so its NEWEST filing can be
+    # years old (e.g. Eiffage stops at FY2023); serving it would silently
+    # hand the pipeline stale numbers. Fail with a clear message instead.
+    try:
+        from prototypes.ir_fetch_proto import MIN_FISCAL_YEAR as _floor
+    except Exception:
+        from datetime import datetime as _dt
+        _floor = _dt.utcnow().year - 1
+    period = str(attrs.get("period_end") or "")
+    m = re.match(r"(\d{4})", period)
+    if m and int(m.group(1)) < _floor:
+        raise LookupError(
+            f"Newest ESEF filing on filings.xbrl.org for LEI {lei!r} is "
+            f"FY{m.group(1)} (period_end {period}) — older than the "
+            f"FY{_floor} freshness floor, so it is NOT served. The "
+            f"repository's coverage is partial; use the company's IR site "
+            f"or the reports archive (POST /api/reports/collect) for a "
+            f"current report."
+        )
+    return attrs
 
 
 # ── Step 2: render the iXBRL report document to PDF ───────────────────

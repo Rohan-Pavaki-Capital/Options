@@ -59,7 +59,7 @@ def _summary_row(r: dict) -> dict:
     }
 
 
-router = APIRouter()
+router = APIRouter(tags=["Simply Wall St"])
 
 
 def _split_exchange_prefix(ticker: str, exchange: str | None):

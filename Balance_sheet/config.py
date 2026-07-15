@@ -39,6 +39,16 @@ TITLE_VARIANTS = [
     # "condensed statement of financial position" summary tables (EUR million,
     # % change) earlier in the document that would shadow the real statement.
     "CONSOLIDATED STATEMENT OF FINANCIAL POSITION",
+    # French (ESEF filings are official-language only; e.g. Eiffage's URD).
+    # Matching is accent-folded in the locator, so accents here are cosmetic.
+    "BILAN CONSOLIDÉ",
+    "ÉTAT CONSOLIDÉ DE LA SITUATION FINANCIÈRE",
+    "ÉTAT DE LA SITUATION FINANCIÈRE CONSOLIDÉE",
+    # Eiffage-style URDs title the statement pages just "Actif" / "Capitaux
+    # propres et passifs" under the running header "Comptes consolidés" —
+    # broad, but the assets-total + equity-total confirm gates in the locator
+    # keep it from matching notes/TOC pages.
+    "COMPTES CONSOLIDÉS",
 ]
 
 # Stage 4 — rounding-aware tally tolerance. Filings round every printed line,

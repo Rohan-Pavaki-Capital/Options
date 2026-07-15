@@ -32,8 +32,24 @@ ASSET_MEMO_KEYS = [k for k in MEMO_KEYS if k != "long_term_debt"]
 LIABILITY_MEMO_KEYS = ["long_term_debt"]
 
 
+def _normalize_number_text(s: str) -> str:
+    """Strip currency marks and normalize FRENCH number formatting to plain
+    form, preserving ' + ' chain separators:
+      NBSP/narrow-NBSP -> space; digit-grouping spaces removed ("1 245" ->
+      "1245", "845 + 5 829" -> "845 + 5829"); decimal comma -> dot
+      ("1 013,5" -> "1013.5" — a comma + 1-2 trailing digits is a decimal
+      mark, a comma + 3-digit group is US grouping); remaining (grouping)
+      commas stripped ("12,470" -> "12470", exactly as before)."""
+    s = (s.replace("$", "").replace("€", "")
+          .replace(" ", " ").replace(" ", " "))
+    s = re.sub(r"(?<=\d) (?=\d{3}(?!\d))", "", s)
+    s = re.sub(r",(\d{1,2})(?!\d)", r".\1", s)
+    return s.replace(",", "").strip()
+
+
 def coerce_number(value, warnings: list, label: str):
-    """Coerce a bucket value to int/float. Only "$" and "," are stripped."""
+    """Coerce a bucket value to int/float. Only currency marks, digit-group
+    separators (",", French " ") and the French decimal comma are cleaned."""
     if value is None:
         return 0
     if isinstance(value, bool):
@@ -41,7 +57,7 @@ def coerce_number(value, warnings: list, label: str):
     if isinstance(value, (int, float)):
         return value
     if isinstance(value, str):
-        cleaned = value.replace("$", "").replace(",", "").strip()
+        cleaned = _normalize_number_text(value)
         if cleaned in ("", "-", "—"):
             return 0
         try:
@@ -421,7 +437,10 @@ def _field_terms(value) -> list:
     if isinstance(value, bool) or value is None:
         return []
     if isinstance(value, str):
-        cleaned = value.replace("$", "").replace(",", "")
+        # Same normalization as coerce_number — without it a French
+        # space-grouped term ("1 245") splits into two bogus terms (1, 245)
+        # and small digits ("2") false-flag as single-count violations.
+        cleaned = _normalize_number_text(value)
         return [float(t.replace(" ", "")) for t in _CHAIN_TERM_RE.findall(cleaned)]
     if isinstance(value, (int, float)) and value:
         return [float(value)]
