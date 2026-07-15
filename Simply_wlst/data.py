@@ -54,6 +54,12 @@ HIST = {"TOTAL_REV": "revenue", "BASIC_EPS": "eps", "NI": "earnings", "CASH_OPER
 EXTRAS = {"FCF_EST": "fcf", "REVENUE_NUM_EST": "analysts"}
 
 
+def _log(msg):
+    """Failure-path diagnostics. Always printed (stderr, flushed) so hosted
+    deploys (Railway etc.) capture the real reason behind a scrape failure."""
+    print(f"[sws] {msg}", file=sys.stderr, flush=True)
+
+
 def session():
     s = http.Session(impersonate=IMP) if IMP else http.Session()
     s.headers.update({"User-Agent": UA})
@@ -114,15 +120,18 @@ def _firecrawl_find(ticker, exchange, debug=False):
     """Search via Firecrawl (residential proxies) when DDG/Bing are blocked.
     Returns the /future URL or None (no key / no match)."""
     if not _fc_key():
-        if debug: print("[debug] FIRECRAWL_API_KEY not set — skipping Firecrawl search", file=sys.stderr)
+        _log("FIRECRAWL_API_KEY not set — skipping Firecrawl search")
         return None
     q = f"{ticker} {exchange or ''} Future Growth simply wall street".strip()
     try:
         results = _fc_post(FC_SEARCH_EP, {"query": q, "limit": 8}, timeout=90)
     except Exception as e:
-        if debug: print(f"[debug] firecrawl search error: {e}", file=sys.stderr)
+        _log(f"Firecrawl search failed for {ticker!r}: {e}")
         return None
-    return _parse(" ".join(str(it.get("url") or "") for it in (results or [])), ticker)
+    url = _parse(" ".join(str(it.get("url") or "") for it in (results or [])), ticker)
+    if not url:
+        _log(f"Firecrawl search returned {len(results or [])} results but none matched ticker {ticker!r}")
+    return url
 
 
 def _firecrawl_page_html(url, debug=False):
@@ -130,14 +139,18 @@ def _firecrawl_page_html(url, debug=False):
     Cloudflare-blocked. Returns raw HTML (state blob is server-rendered, so it
     survives) or None."""
     if not _fc_key():
+        _log("FIRECRAWL_API_KEY not set — cannot fetch page via Firecrawl")
         return None
     try:
         data = _fc_post(FC_SCRAPE_EP, {"url": url, "formats": ["rawHtml"],
                                        "waitFor": 3000, "timeout": 60000,
                                        "proxy": "auto", "blockAds": True})
-        return data.get("rawHtml") or None
+        html = data.get("rawHtml") or None
+        if html is None:
+            _log(f"Firecrawl scrape of {url} succeeded but returned no rawHtml")
+        return html
     except Exception as e:
-        if debug: print(f"[debug] firecrawl scrape error: {e}", file=sys.stderr)
+        _log(f"Firecrawl scrape failed for {url}: {e}")
         return None
 
 
@@ -152,7 +165,7 @@ def find_url(s, ticker, exchange, debug=False):
             try:
                 html = _query(s, engine, eurl, q)
             except Exception as e:
-                if debug: print(f"[debug] {engine} error: {e}", file=sys.stderr)
+                _log(f"{engine} search error for {ticker!r}: {e}")
                 html = ""
             url = _parse(html, ticker)
             if url:
@@ -160,7 +173,7 @@ def find_url(s, ticker, exchange, debug=False):
                 return url
             if _blocked(html):
                 wait = 2 ** attempt + random.random()
-                if debug: print(f"[debug] {engine} blocked ({len(html)}b), backoff {wait:.1f}s", file=sys.stderr)
+                _log(f"{engine} blocked ({len(html)}b) for {ticker!r}, backoff {wait:.1f}s")
                 time.sleep(wait); continue
             break
     url = _firecrawl_find(ticker, exchange, debug)
@@ -174,11 +187,13 @@ def get_state(s, url):
     try:
         html = s.get(url, timeout=30).text
         return parse_state(html)
-    except (Exception, SystemExit):
+    except (Exception, SystemExit) as e:
         # Direct fetch blocked (Cloudflare on datacenter IPs) or blob missing —
         # retry once through Firecrawl before giving up.
+        _log(f"direct fetch of {url} failed ({e}) — trying Firecrawl fallback")
         fc_html = _firecrawl_page_html(url)
         if fc_html is None:
+            _log("Firecrawl fallback unavailable — re-raising original error")
             raise
         return parse_state(fc_html)
 
@@ -186,6 +201,11 @@ def get_state(s, url):
 def parse_state(html):
     m = re.search(r"window\.__REACT_QUERY_STATE__\s*=\s*", html)
     if not m:
+        low = html.lower()
+        hint = ("looks like a Cloudflare challenge/block page"
+                if ("cloudflare" in low or "cf-ray" in low or "just a moment" in low)
+                else "no Cloudflare marker seen")
+        _log(f"state blob missing: html_len={len(html)}, {hint}")
         raise SystemExit("Data blob not found on page (layout changed?).")
     blob = html[m.end():html.find("</script>", m.end())].strip().rstrip(";")
     blob = re.sub(r"(?<=[:,\[])undefined(?=[,}\]])", "null", blob)
