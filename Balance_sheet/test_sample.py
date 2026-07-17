@@ -56,6 +56,29 @@ Known trap: the standardizer used to lump current portion 999 + long-term 7,030
 into current.debt (8,029), oversize non_current.other_liabilities (3,360), and
 let the auto-plug shave 10 off other_current_liabilities to force the tie —
 "balanced" but the bucket breakdown was wrong.
+
+Kawasaki Heavy Industries (TSE:7012) FY2026-03-31, IFRS (markdown fixture, run
+with region="eu"; Stages 3-4 only; transcribed from the Consolidated Statement
+of Financial Position, "in millions of yen"):
+    filing_totals.total_assets == 3,324,623 ; total_liabilities == 2,376,129 ; both balanced.
+    FIX 1 — the CURRENT "Assets held for sale" (18,065) lands in
+        assets.current.other_current_assets (~236,370, with other financial
+        16,951 + other current 201,354); assets.non_current.assets_held_for_sale == 0.
+    Section subtotals (derived; a few yen under the printed subtotal rows from
+        filing rounding — asserted within tolerance): non-current (buckets +
+        goodwill + intangibles) ~= 1,068,584 ; current (buckets + cash) ~= 2,256,039.
+    memo: cash 115,414, goodwill 0, intangibles 82,519, long_term_debt 358,516.
+    liabilities.current.debt == 502,673 ; debt summary short 502,673 / long
+        358,516 / total 861,189.
+    FIX 2 — current contract liabilities (386,895) sit in
+        other_current_liabilities (~767,428); deferred_rev_and_tax (current) ==
+        18,596 (income taxes payable only, not 405,491).
+    FIX 3 — the non-current "Other financial assets" (79,018) maps to
+        investment_assets; other_assets == ~154,833 (deferred tax 119,475 +
+        other non-current 35,358 only).
+Rounding note: the filing's printed subtotal rows (2,256,039 / 1,068,584) exceed
+the sum of their component lines by 3 yen — the check tolerates this rather than
+asserting an unattainable exact tie.
 """
 
 import json
@@ -69,11 +92,15 @@ DHC_SAMPLE_PDF = r"test_data\dhc_10q.pdf"
 AAPL_SAMPLE_PDF = r"test_data\aapl_10q.pdf"
 CME_SAMPLE_PDF = r"test_data\cme_10q.pdf"
 NIKE_SAMPLE_MD = r"test_data\nike_10q.md"
+KAWASAKI_SAMPLE_MD = r"test_data\kawasaki_ir.md"
 
 # NIKE prints Total assets but no explicit "Total liabilities" line — the
 # code-read tally targets (most-recent column) are supplied here, exactly as
 # pdf_locator.extract_printed_totals would for a PDF sample.
 NIKE_PRINTED_TOTALS = {"total_assets": 37064, "total_liabilities": 22974}
+
+# Kawasaki prints both totals (most-recent 2026 column, millions of yen).
+KAWASAKI_PRINTED_TOTALS = {"total_assets": 3324623, "total_liabilities": 2376129}
 
 _PLUG_MARKERS = ("Auto-plugged", "Auto-removed", "LIKELY WRONG-BUCKET")
 
@@ -238,11 +265,108 @@ def check_nike(result: dict) -> list[str]:
     return failures
 
 
+def check_kawasaki(result: dict) -> list[str]:
+    # Filings round every printed line, so the summed buckets sit a few yen
+    # below the printed subtotal rows (see the module docstring). Assert the
+    # rounding-affected aggregates within a small tolerance; single-line values
+    # (memo, debt, investment_assets) are exact.
+    TOL = 10
+    failures = []
+    tally = result["tally"]
+    totals = result["filing_totals"]
+    a_cur = result["assets"]["current"]
+    a_non = result["assets"]["non_current"]
+    l_cur = result["liabilities"]["current"]
+    memo = result["memo_excluded"]
+
+    if totals["total_assets"] != 3324623:
+        failures.append(f"total_assets {totals['total_assets']:,} != 3,324,623")
+    if totals["total_liabilities"] != 2376129:
+        failures.append(f"total_liabilities {totals['total_liabilities']:,} != 2,376,129")
+    if not tally["assets_balanced"]:
+        failures.append("assets_balanced is False")
+    if not tally["liabilities_balanced"]:
+        failures.append("liabilities_balanced is False")
+
+    # FIX 1: current "Assets held for sale" (18,065) belongs in
+    # current.other_current_assets, NOT non-current assets_held_for_sale.
+    if a_non["assets_held_for_sale"] != 0:
+        failures.append(
+            f"non_current.assets_held_for_sale {a_non['assets_held_for_sale']:,} != 0 "
+            f"(current AHS must land in current.other_current_assets — FIX 1)"
+        )
+    if abs(a_cur["other_current_assets"] - 236370) > TOL:
+        failures.append(
+            f"current.other_current_assets {a_cur['other_current_assets']:,} != ~236,370 "
+            f"(other financial 16,951 + other current 201,354 + AHS 18,065 — FIX 1)"
+        )
+
+    # Section subtotals — derived sums, within filing rounding of the printed
+    # subtotal rows (2,256,039 current / 1,068,584 non-current).
+    non_current_subtotal = sum(a_non.values()) + memo["goodwill"] + memo["intangibles"]
+    if abs(non_current_subtotal - 1068584) > TOL:
+        failures.append(
+            f"non-current subtotal {non_current_subtotal:,} not within {TOL} of 1,068,584"
+        )
+    current_subtotal = sum(a_cur.values()) + memo["cash_and_marketable_securities"]
+    if abs(current_subtotal - 2256039) > TOL:
+        failures.append(
+            f"current subtotal {current_subtotal:,} not within {TOL} of 2,256,039"
+        )
+
+    # Memo fields — each a single printed line (exact).
+    for key, want in (("cash_and_marketable_securities", 115414),
+                      ("goodwill", 0), ("intangibles", 82519),
+                      ("long_term_debt", 358516)):
+        if memo[key] != want:
+            failures.append(f"memo.{key} {memo[key]:,} != {want:,}")
+
+    if l_cur["debt"] != 502673:
+        failures.append(f"liabilities.current.debt {l_cur['debt']:,} != 502,673")
+
+    # Debt summary rollup (short-term = current.debt, long-term = memo LT debt).
+    debt = result.get("debt", {})
+    for key, want in (("short_term_debt", 502673), ("long_term_debt", 358516),
+                      ("total_debt", 861189)):
+        if debt.get(key) != want:
+            failures.append(f"debt.{key} {debt.get(key)} != {want:,}")
+
+    # FIX 2: current contract liabilities (386,895) sit in
+    # other_current_liabilities; deferred_rev_and_tax (current) is tax-only.
+    if l_cur["deferred_rev_and_tax"] != 18596:
+        failures.append(
+            f"liabilities.current.deferred_rev_and_tax {l_cur['deferred_rev_and_tax']:,} "
+            f"!= 18,596 (income taxes payable only — FIX 2; 405,491 would mean contract "
+            f"liabilities were left in this bucket)"
+        )
+    if abs(l_cur["other_current_liabilities"] - 767428) > TOL:
+        failures.append(
+            f"liabilities.current.other_current_liabilities "
+            f"{l_cur['other_current_liabilities']:,} != ~767,428 (must include contract "
+            f"liabilities 386,895 — FIX 2)"
+        )
+
+    # FIX 3: non-current "Other financial assets" (79,018) -> investment_assets.
+    if a_non["investment_assets"] != 79018:
+        failures.append(
+            f"non_current.investment_assets {a_non['investment_assets']:,} != 79,018 "
+            f"(non-current 'Other financial assets' — FIX 3)"
+        )
+    if abs(a_non["other_assets"] - 154833) > TOL:
+        failures.append(
+            f"non_current.other_assets {a_non['other_assets']:,} != ~154,833 "
+            f"(deferred tax 119,475 + other non-current 35,358; the 79,018 financial "
+            f"assets moved to investment_assets — FIX 3)"
+        )
+    return failures
+
+
 SAMPLES = [
     (DHC_SAMPLE_PDF, "dhc", check_dhc),
     (AAPL_SAMPLE_PDF, "aapl", check_aapl),
     (CME_SAMPLE_PDF, "cme", check_cme),
     (NIKE_SAMPLE_MD, "nike", check_nike),
+    (KAWASAKI_SAMPLE_MD, "kawasaki", check_kawasaki),
 ]
 
 
@@ -251,8 +375,15 @@ def _run_one(pdf_path: str) -> list[str]:
         # Markdown fixture — Stages 3-4 only (no PDF locate/parse).
         with open(pdf_path, encoding="utf-8") as fh:
             markdown = fh.read()
-        printed = NIKE_PRINTED_TOTALS if "nike" in pdf_path.lower() else None
-        result = run_markdown_pipeline(markdown, printed_totals=printed)
+        name = pdf_path.lower()
+        if "kawasaki" in name:
+            printed, region = KAWASAKI_PRINTED_TOTALS, "eu"  # IFRS filing
+        elif "nike" in name:
+            printed, region = NIKE_PRINTED_TOTALS, None
+        else:
+            printed, region = None, None
+        result = run_markdown_pipeline(markdown, printed_totals=printed,
+                                       region=region)
     else:
         result = run_pipeline(pdf_path)
     print(json.dumps(result, indent=2))

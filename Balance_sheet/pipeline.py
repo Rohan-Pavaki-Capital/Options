@@ -15,7 +15,8 @@ from .config import TALLY_MAX_RETRIES, empty_result
 logger = logging.getLogger("balance_sheet.pipeline")
 
 
-def _merge_balanced_sides(first: dict, retry: dict) -> dict:
+def _merge_balanced_sides(first: dict, retry: dict,
+                          line_items: list | None = None) -> dict:
     """The tally re-prompt may fix one side while regressing the other. Assets
     and liabilities buckets are disjoint, so keep — per side — whichever run
     lands closer to its printed total; the retry wins only where it improves.
@@ -41,7 +42,7 @@ def _merge_balanced_sides(first: dict, retry: dict) -> dict:
             merged["memo_excluded"][k] = first["memo_excluded"][k]
         merged["filing_totals"]["total_liabilities"] = first["filing_totals"]["total_liabilities"]
         logger.info("Retry regressed the liabilities side — keeping first run's liabilities.")
-    tally.run_tally(merged)
+    tally.run_tally(merged, line_items)
     return merged, kept
 
 
@@ -63,7 +64,8 @@ def _merge_raw_sides(first_raw: dict, retry_raw: dict, kept: dict) -> dict:
 def run_markdown_pipeline(markdown: str, source_pages: list | None = None,
                           printed_totals: dict | None = None,
                           unit_label: str | None = None,
-                          region: str | None = None) -> dict:
+                          region: str | None = None,
+                          page_text: str | None = None) -> dict:
     """Stages 3-4 on balance-sheet markdown that is already in hand:
     LLM standardization, then the code tally with the LLM correction loop.
     A side still unbalanced after the retries is returned honestly unbalanced
@@ -106,7 +108,8 @@ def run_markdown_pipeline(markdown: str, source_pages: list | None = None,
     # selects the European/IFRS prompt (prompt_eu.py); None/anything else
     # keeps the existing US prompt.
     try:
-        result = standardizer.standardize(markdown, region=region)
+        result = standardizer.standardize(markdown, region=region,
+                                          page_text=page_text)
     except Exception as exc:
         logger.exception("Stage 3 (standardize) failed")
         result = empty_result()
@@ -129,10 +132,13 @@ def run_markdown_pipeline(markdown: str, source_pages: list | None = None,
     raw = copy.deepcopy(result)
     tally.coerce_result_numbers(result)
     _apply_printed_totals(result)
-    tally.run_tally(result)
 
-    line_items = standardizer.extract_line_items(markdown)
+    line_items = standardizer.extract_line_items(markdown,
+                                                 page_text=page_text)
     tagged = len(line_items) >= 5  # same reliability bar as the prompt checklist
+    # line_items ride into the tally so the diagnosis can match an over-count
+    # against a printed NEGATIVE contra line (Japanese-GAAP allowance lines).
+    tally.run_tally(result, line_items)
     duplicates = tally.find_chain_duplicates(raw, line_items) if tagged else []
 
     for attempt in range(1, TALLY_MAX_RETRIES + 1):
@@ -153,13 +159,14 @@ def run_markdown_pipeline(markdown: str, source_pages: list | None = None,
             # the model remove a single duplicated term instead of guessing
             # a new bucket total.
             retry = standardizer.restandardize(markdown, raw, gap_message,
-                                               region=region)
+                                               region=region,
+                                               page_text=page_text)
             retry["source_pages"] = source_pages
             retry_raw = copy.deepcopy(retry)
             tally.coerce_result_numbers(retry)
             _apply_printed_totals(retry)
-            tally.run_tally(retry)
-            result, kept = _merge_balanced_sides(result, retry)
+            tally.run_tally(retry, line_items)
+            result, kept = _merge_balanced_sides(result, retry, line_items)
             raw = _merge_raw_sides(raw, retry_raw, kept)
             duplicates = tally.find_chain_duplicates(raw, line_items) if tagged else []
         except Exception as exc:
@@ -198,6 +205,11 @@ def run_markdown_pipeline(markdown: str, source_pages: list | None = None,
 
     # Final step: convert everything to millions (unit_label is finalized above)
     tally.normalize_to_millions(result)
+    # Additive reporting rollup of interest-bearing debt already mapped above
+    # (short-term = current.debt, long-term = memo long_term_debt). Runs after
+    # normalization so it mirrors the final scaled values; returns a new dict
+    # with `debt` slotted between memo_excluded and filing_totals.
+    result = tally.attach_debt_summary(result)
     return result
 
 
@@ -244,9 +256,12 @@ def run_pipeline(pdf_path: str, region: str | None = None) -> dict:
             return result
         logger.info("Markdown length: %d chars", len(markdown))
 
-        # Stages 3-4 — standardize + tally
+        # Stages 3-4 — standardize + tally. The Stage-1 page text rides along
+        # so the checklist's label/value pairing can be validated against the
+        # page (LlamaParse sometimes shifts the value column one row).
         result = run_markdown_pipeline(markdown, source_pages, printed_totals,
-                                       unit_label, region=region)
+                                       unit_label, region=region,
+                                       page_text=located.get("captured_text"))
         result["warnings"] = stage1_warnings + result["warnings"]
         return result
     finally:

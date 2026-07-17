@@ -34,11 +34,15 @@ TITLE_VARIANTS = [
     "STATEMENTS OF FINANCIAL POSITION",
     "CONSOLIDATED STATEMENTS OF FINANCIAL POSITION",
     # IFRS singular wording (e.g. Scout24) — the plural variants above never
-    # match "Consolidated statement of financial position". Deliberately NOT
-    # the bare "STATEMENT OF FINANCIAL POSITION": management reports carry
-    # "condensed statement of financial position" summary tables (EUR million,
-    # % change) earlier in the document that would shadow the real statement.
+    # match "Consolidated statement of financial position".
     "CONSOLIDATED STATEMENT OF FINANCIAL POSITION",
+    # Bare singular, no "consolidated" — ASX/AASB filers (e.g. Clinuvel) title
+    # the primary statement just "Statement of Financial Position as at <date>".
+    # This was previously excluded to avoid management-report "condensed
+    # statement of financial position" summary tables (EUR million, % change)
+    # shadowing the real statement; the locator now skips %-change summary
+    # pages (_looks_like_change_summary), so the bare variant is safe.
+    "STATEMENT OF FINANCIAL POSITION",
     # French (ESEF filings are official-language only; e.g. Eiffage's URD).
     # Matching is accent-folded in the locator, so accents here are cosmetic.
     "BILAN CONSOLIDÉ",

@@ -95,6 +95,63 @@ def _looks_like_statements_toc(text: str) -> bool:
     return sum(1 for t in _OTHER_STATEMENT_TITLES if t in text) >= 2
 
 
+# Fiscal-year tokens, bare or FY-prefixed ("FY2015" has no \b before the
+# digits, so a plain \b20\d{2}\b regex never sees it).
+_YEAR_TOKEN_RE = re.compile(r"\b(?:fy\s?)?(20\d{2})\b")
+
+
+_CHANGE_SUMMARY_RE = re.compile(
+    r"%\s*change|change\s*%|%\s*chg|\bchange\b\s*\(?%\)?|"
+    r"increase\s*/?\s*\(?decrease\)?\s*%", re.IGNORECASE)
+
+
+def _looks_like_change_summary(text: str) -> bool:
+    """Management-report balance-sheet SUMMARY tables print a period-over-period
+    "% change" / "Change %" column (e.g. a "condensed statement of financial
+    position" recap with EUR-million figures and a percentage-change column) —
+    the real statement never carries one. Skipping these keeps a management
+    summary from shadowing the actual statement further into the document."""
+    return _CHANGE_SUMMARY_RE.search(text) is not None
+
+
+def _looks_like_multiyear_summary(text: str) -> bool:
+    """Multi-year financial summary tables (MUFG's "Ten-Year Summary of Major
+    Financial Data" prints a "Balance sheet data:" section under columns
+    FY2015..FY2024) match a balance-sheet title + "Total assets" exactly like
+    the real statement does — but they are a decade of selected data, not the
+    statement. A real balance sheet compares 2-3 period columns; five or more
+    CONSECUTIVE fiscal years on one page mark a summary table."""
+    years = sorted({int(m.group(1)) for m in _YEAR_TOKEN_RE.finditer(text)})
+    best = run = 1 if years else 0
+    for prev, cur in zip(years, years[1:]):
+        run = run + 1 if cur == prev + 1 else 1
+        best = max(best, run)
+    return best >= 5
+
+
+def _title_match(text: str, variants: list[str]) -> str | None:
+    """First variant with at least one REAL title occurrence — i.e. not
+    summary-table or prose wording. An occurrence does NOT count when it is
+      - followed by "data"/"date": "Balance sheet data:" heads selected-data
+        tables (MUFG's 20-F p94 / integrated report), "as of the balance
+        sheet date" is note prose;
+      - preceded by "average": "Average Balance Sheets, Interest and Average
+        Rates" is the Guide-3 statistical section, whose average balances
+        must never be read as the statement;
+      - preceded by "off"/"off-": "off-balance sheet arrangements".
+    """
+    for v in variants:
+        for m in re.finditer(re.escape(v), text):
+            tail = text[m.end():m.end() + 10].lstrip(" \n:—-*")
+            if tail.startswith(("data", "date")):
+                continue
+            head = text[max(0, m.start() - 12):m.start()].rstrip(" \n-")
+            if head.endswith(("average", "off")):
+                continue
+            return v
+    return None
+
+
 def _has_statement_structure(text: str) -> bool:
     """Lenient confirmation for filers (e.g. APA) that print EVERY total row
     unlabeled — no "Total assets" / "Total current assets" text exists on the
@@ -117,17 +174,30 @@ def locate_balance_sheet(pdf_path: str) -> dict:
         raise RuntimeError(f"PDF not found: {pdf_path}")
 
     variants = [_fold(v) for v in TITLE_VARIANTS]
+    # Variant priority: a SPECIFIC statement title ("Consolidated Balance
+    # Sheets", "... Statement(s) of Financial Position", the French titles)
+    # anywhere in the document outranks the bare "BALANCE SHEET" variant,
+    # which a large filing matches on dozens of prose/summary pages (MUFG's
+    # 512pp 20-F: "Balance sheet data:", "off-balance sheet", ... on ~50
+    # pages, shadowing the real "Consolidated Balance Sheets" on p300).
+    # The specific pass takes OUTRIGHT accepts only (no last-resort
+    # candidates — an assets-only specific match must not shadow a full
+    # bare-titled statement); the all-variants pass that follows is EXACTLY
+    # the previous behavior, so bare-title-only filers (BMW) are unchanged.
+    specific = [v for v in variants if v != "balance sheet"]
     warnings: list[str] = []
 
     with fitz.open(pdf_path) as doc:
-        result = _scan(doc, variants, warnings, lenient=False)
-        if result is None:
-            # No page passed the labeled-total check. Some filers (e.g. APA)
-            # print every total row unlabeled, so re-scan accepting the
-            # statement's structure (section headings + equity total) instead.
-            result = _scan(doc, variants, warnings, lenient=True)
-        if result is not None:
-            return result
+        for lenient in (False, True):
+            # lenient=True re-scans accepting the statement's structure
+            # (section headings + equity total) for filers (e.g. APA) that
+            # print every total row unlabeled.
+            result = _scan(doc, specific, warnings, lenient,
+                           last_resort=False)
+            if result is None:
+                result = _scan(doc, variants, warnings, lenient)
+            if result is not None:
+                return result
 
     raise RuntimeError(
         "No balance-sheet page found - none of the title variants matched a "
@@ -136,7 +206,7 @@ def locate_balance_sheet(pdf_path: str) -> dict:
 
 
 def _scan(doc: "fitz.Document", variants: list[str], warnings: list[str],
-          lenient: bool):
+          lenient: bool, last_resort: bool = True):
     """One pass over the document; returns the locate result dict or None.
 
     Strict mode confirms a title match with a labeled assets total ("Total
@@ -173,8 +243,20 @@ def _scan(doc: "fitz.Document", variants: list[str], warnings: list[str],
     n_pages = len(doc)
     for i in range(n_pages):
         text = _page_text(doc, i)
-        matched = next((v for v in variants if v in text), None)
+        matched = _title_match(text, variants)
         if not matched:
+            continue
+
+        # Multi-year summary tables ("Ten-Year Summary ... Balance sheet
+        # data:") are never the statement — skip before they can be accepted
+        # or remembered as the assets-only fallback.
+        if _looks_like_multiyear_summary(text):
+            continue
+
+        # Management-report summary recaps with a "% change" column (e.g. a
+        # "condensed statement of financial position" table earlier in the
+        # document) are never the statement — skip so they can't shadow it.
+        if _looks_like_change_summary(text):
             continue
 
         # Running-header/TOC pages: French URDs repeat the section title
@@ -183,7 +265,7 @@ def _scan(doc: "fitz.Document", variants: list[str], warnings: list[str],
         # its own and the NEXT page matches a title too, anchor there instead
         # — otherwise the TOC page is captured and feeds the LLM noise.
         if (not _has_assets_total(text) and i + 1 < n_pages
-                and any(v in _page_text(doc, i + 1) for v in variants)):
+                and _title_match(_page_text(doc, i + 1), variants)):
             continue
 
         # Capture the matched page alone when it already holds the whole
@@ -230,6 +312,12 @@ def _scan(doc: "fitz.Document", variants: list[str], warnings: list[str],
             )
         return _build_locate_result(doc, indices, matched, warnings, lenient)
 
+    if not last_resort:
+        # Priority pass (specific titles only): outright accepts were taken
+        # above; last-resort candidates are NOT returned — the follow-up
+        # all-variants scan rediscovers them and weighs them against every
+        # page, exactly as before the priority pass existed.
+        return None
     if structure_candidate is not None:
         indices, matched = structure_candidate
         warnings.append(

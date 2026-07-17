@@ -23,6 +23,7 @@ export const COUNTRY_META = {
   malaysia:  { label: 'Malaysia',      code: 'MY', region: 'Asia-Pacific' },
   thailand:  { label: 'Thailand',      code: 'TH', region: 'Asia-Pacific' },
   singapore: { label: 'Singapore',     code: 'SG', region: 'Asia-Pacific' },
+  australia: { label: 'Australia',      code: 'AU', region: 'Asia-Pacific' },
   israel:    { label: 'Israel',        code: 'IL', region: 'Asia-Pacific' },
 }
 

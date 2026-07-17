@@ -64,8 +64,16 @@ def _ensure_truststore() -> None:
 
 
 _ANNUAL_DOC_TYPE = "120"      # 有価証券報告書 — Annual Securities Report
+_SEMIANNUAL_DOC_TYPE = "160"  # 半期報告書 — Semi-Annual Report (the shortest
+                              # statement cadence on EDINET: quarterly reports
+                              # 四半期報告書 were abolished in April 2024)
 _DEFAULT_LOOKBACK_DAYS = 400  # > 1 year, so the latest annual report is always caught
 _PDF_DOC_TYPE = 2             # EDINET document download `type`: 2 = submitted PDF
+
+_DOC_TYPE_NAMES = {
+    _ANNUAL_DOC_TYPE: "Annual Securities Report (有価証券報告書)",
+    _SEMIANNUAL_DOC_TYPE: "Semi-Annual Report (半期報告書)",
+}
 
 
 def _api_key() -> str:
@@ -80,15 +88,15 @@ def _api_key() -> str:
     return key
 
 
-def _select_latest_annual(documents: list) -> Any:
-    """Pick the newest annual securities report from the entity's filings.
+def _select_latest_annual(documents: list, doc_types: tuple = (_ANNUAL_DOC_TYPE,)) -> Any:
+    """Pick the newest filing among `doc_types` from the entity's filings.
 
-    `Entity.documents(doc_type="120", ...)` already filters to docTypeCode 120
-    and returns newest-first, but we re-verify the type code and prefer the most
+    `Entity.documents(doc_type=..., ...)` already filters by docTypeCode and
+    returns newest-first, but we re-verify the type code and prefer the most
     recent by filing datetime to be robust to ordering changes."""
     candidates = [
         d for d in (documents or [])
-        if (getattr(d, "doc_type_code", "") or "") == _ANNUAL_DOC_TYPE
+        if (getattr(d, "doc_type_code", "") or "") in doc_types
     ]
     if not candidates:
         return None
@@ -145,7 +153,17 @@ def fetch_filing_as_pdf(
     if entity is None:
         raise LookupError(f"EDINET code {edinet_code!r} not found in EDINET.")
 
-    documents = entity.documents(doc_type=_ANNUAL_DOC_TYPE, days=lookback_days)
+    # category="latest": the freshest statement filing across the annual (120)
+    # and semi-annual (160) reports — the balance-sheet flow's "most recent
+    # quarterly/interim first" rule (2026-07-17). EDINET has no quarterly
+    # reports (四半期報告書 abolished April 2024), so 160 is the shortest
+    # cadence available. Any other category keeps the annual-only behavior.
+    doc_types = ((_ANNUAL_DOC_TYPE, _SEMIANNUAL_DOC_TYPE)
+                 if (category or "").lower() in ("latest", "interim", "quarterly")
+                 else (_ANNUAL_DOC_TYPE,))
+    documents = []
+    for _dt in doc_types:
+        documents.extend(entity.documents(doc_type=_dt, days=lookback_days) or [])
 
     if scan_progress:
         try:
@@ -153,10 +171,11 @@ def fetch_filing_as_pdf(
         except Exception:
             pass
 
-    doc = _select_latest_annual(documents)
+    doc = _select_latest_annual(documents, doc_types)
     if doc is None:
+        kinds = " / ".join(_DOC_TYPE_NAMES[t] for t in doc_types)
         raise LookupError(
-            f"No annual securities report (有価証券報告書) found for EDINET code "
+            f"No {kinds} found for EDINET code "
             f"{edinet_code!r} in the last {lookback_days} days."
         )
 
@@ -193,7 +212,9 @@ def fetch_filing_as_pdf(
         "company_number": edinet_code,
         "company": company_name or getattr(doc, "filer_name", None) or edinet_code,
         "category": category,
-        "form": getattr(doc, "doc_type_name", None) or "Annual Securities Report (有価証券報告書)",
+        "form": (getattr(doc, "doc_type_name", None)
+                 or _DOC_TYPE_NAMES.get(getattr(doc, "doc_type_code", "") or "")
+                 or "Annual Securities Report (有価証券報告書)"),
         "filing_date": filing_dt.strftime("%Y-%m-%d") if filing_dt else "",
         "report_period": period,
         "doc_id": doc.doc_id,

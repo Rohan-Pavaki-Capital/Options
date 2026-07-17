@@ -1,22 +1,18 @@
-"""European / IFRS system prompt for Stage 3 standardization.
+"""Australian (AASB / IFRS) system prompt for Stage 3 standardization.
 
-Used INSTEAD of standardizer.SYSTEM_PROMPT when the company is European
-(selected by the caller via region="eu"; US and all other markets keep the
-existing prompt). Same fixed schema, same memo section, same house
-conventions and number rules — the differences are ONLY about how European
-IFRS filings PRESENT the statement:
-
-  * titled "(Consolidated) Statement of Financial Position" or "Balance
-    Sheet"; non-current items usually listed BEFORE current ones;
-  * the closing total is printed equity-first ("Total equity and
-    liabilities") and there is often NO standalone "Total liabilities" row;
-  * IFRS line-item vocabulary (trade and other receivables, provisions,
-    interest-bearing loans and borrowings, ...).
+Used INSTEAD of standardizer.SYSTEM_PROMPT when the company is Australian
+(selected by the caller via region="au"; US and all other markets keep their
+own prompt). Australian filings report under AASB, which is IFRS-equivalent —
+so this prompt STARTED as a byte-identical copy of prompt_eu.SYSTEM_PROMPT_EU,
+kept separate ONLY so Australia-specific tuning here can never change the
+European/IFRS output (and vice-versa). Edit this file freely for ASX/AASB
+presentation quirks (e.g. singular "Statement of Financial Position", AUD
+wording) without touching Europe.
 
 Keep this file self-contained (no import from standardizer — it imports us).
 """
 
-SYSTEM_PROMPT_EU = """Balance-Sheet Standardizer — Goal Loop (run until totals tally) — EUROPEAN / IFRS FILINGS
+SYSTEM_PROMPT_AU = """Balance-Sheet Standardizer — Goal Loop (run until totals tally) — EUROPEAN / IFRS FILINGS
 
 You are a financial-statement standardizer working like a professional equity analyst.
 You are given the markdown of ONE company's balance sheet (IFRS "statement of financial

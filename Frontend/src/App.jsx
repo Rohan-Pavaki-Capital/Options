@@ -449,6 +449,36 @@ export default function App() {
     }
   }, [presentError])
 
+  const handleFetchAustralia = useCallback(async ({ company_name, ticker }) => {
+    setError(null)
+    setScreen('uploading')
+
+    try {
+      const res = await fetch(`${API_BASE}/extract-from-australia`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ company_name, ticker }),
+      })
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}))
+        let detail = errData.detail
+        if (Array.isArray(detail)) {
+          detail = detail.map((d) => d?.msg || JSON.stringify(d)).join('; ')
+        } else if (detail && typeof detail === 'object') {
+          detail = JSON.stringify(detail)
+        }
+        throw new Error(detail || `Australia fetch failed (${res.status})`)
+      }
+
+      const data = await res.json()
+      setJobId(data.job_id)
+      setScreen('processing')
+    } catch (err) {
+      presentError(err.message)
+    }
+  }, [presentError])
+
   const handleFetchTest = useCallback(async ({ company_name, ticker, country }) => {
     setError(null)
     setScreen('uploading')
@@ -575,6 +605,7 @@ export default function App() {
                 onFetchGermany={handleFetchGermany}
                 onFetchSingapore={handleFetchSingapore}
                 onFetchMexico={handleFetchMexico}
+                onFetchAustralia={handleFetchAustralia}
                 onFetchSimple={handleFetchSimple}
                 onFetchTest={handleFetchTest}
                 uploading={screen === 'uploading'}

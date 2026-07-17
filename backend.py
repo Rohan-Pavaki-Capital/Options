@@ -409,6 +409,50 @@ def _is_us_job(job: dict) -> bool:
     return False
 
 
+# ── IR-URL cache (ticker+country → resolved IR crawl entry URL) ────────────
+# The IR resolver depends on search engines (DDG rate-limits randomly), so a
+# resolve that worked minutes ago can fail on the next run — which silently
+# downgrades the Japan/EU quarterly-first balance-sheet path to the EDGAR/ESEF
+# annual fallback (MUFG live run 2026-07-16: transient resolve failure →
+# 20-F instead of the tanshin). Successful CRAWLS (not bare resolutions —
+# the URL must actually have yielded a report) are remembered here, same
+# pattern as sws_url_cache.json. Best-effort file I/O; corruption = miss.
+_IR_URL_CACHE_PATH = Path(__file__).parent / "ir_url_cache.json"
+_IR_URL_CACHE_TTL_SEC = 30 * 86400
+
+
+def _ir_url_cache_key(ticker: str, name: str, country: str) -> str:
+    who = (ticker or "").strip().upper() or " ".join(
+        (name or "").strip().lower().split())
+    return f"{who}|{(country or '').strip().lower()}"
+
+
+def _ir_url_cache_get(ticker: str, name: str, country: str):
+    try:
+        data = json.loads(_IR_URL_CACHE_PATH.read_text(encoding="utf-8"))
+        ent = data.get(_ir_url_cache_key(ticker, name, country)) or {}
+        if ent.get("url") and (time.time() - (ent.get("ts") or 0)
+                               <= _IR_URL_CACHE_TTL_SEC):
+            return ent["url"]
+    except Exception:
+        pass
+    return None
+
+
+def _ir_url_cache_put(ticker: str, name: str, country: str, url: str):
+    try:
+        try:
+            data = json.loads(_IR_URL_CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        data[_ir_url_cache_key(ticker, name, country)] = {
+            "url": url, "ts": time.time()}
+        _IR_URL_CACHE_PATH.write_text(
+            json.dumps(data, indent=1, sort_keys=True), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def _ir_scraper_fetch_annual(out_pdf_path, name, ticker, country, ocr_cb,
                              timeout_sec=EU_IR_SCRAPER_TIMEOUT_SEC):
     """Run the universal IR scraper for the latest ANNUAL report only, capped at
@@ -631,6 +675,15 @@ def run_extraction_pipeline(job_id: str):
                 import concurrent.futures
                 _annual_pdf = job_dir / f"{pdf_stem}_annual.pdf"
                 _interim_pdf = job_dir / f"{pdf_stem}_interim.pdf"
+                _results_pdf = job_dir / f"{pdf_stem}_results.pdf"
+                # QUARTERLY-FIRST (balance-sheet / fetch-only jobs, user rule
+                # 2026-07-16): prefer the quarterly-cadence financial-results
+                # doc (JP tanshin "Summary Report" / "Financial Highlights" —
+                # freshest period, real consolidated balance sheet) over the
+                # annual report; annual → EDGAR 20-F → EDINET stay as
+                # fallbacks. The options extraction pipeline (not fetch_only)
+                # keeps annual-first — results docs carry no SBC note.
+                _bs_mode = bool(job.get("fetch_only"))
 
                 # fetch_reports records the annual into this sink the MOMENT it
                 # passes the gate (and saves the PDF right then) — so a 100s cap
@@ -641,18 +694,73 @@ def run_extraction_pipeline(job_id: str):
                 def _jp_scrape_both():
                     from prototypes import ir_resolve_proto as _R
                     from prototypes import ir_fetch_proto as _F
-                    _res = _R.resolve(_jp_name or "", _jp_ticker or "", "",
-                                      "Japan")
+                    _cached_url = _ir_url_cache_get(_jp_ticker, _jp_name,
+                                                    "Japan")
+                    if _cached_url:
+                        print(f"[{job_id}] jp: IR URL from cache "
+                              f"{_cached_url}", flush=True)
+                        _res = {"chosen_url": _cached_url,
+                                "confidence": "CACHED"}
+                    else:
+                        _res = _R.resolve(_jp_name or "", _jp_ticker or "", "",
+                                          "Japan")
                     _url = _res.get("chosen_url")
                     if not _url:
                         raise RuntimeError("IR-scraper: could not resolve an IR site")
+                    # Runs on cache hits too: an OPTIONS run may have cached
+                    # the Japanese root; the probe is 1-3 cheap GETs and
+                    # self-skips when the URL is already an /english|/en path.
+                    if _bs_mode:
+                        # JP sites conventionally host the English IR library
+                        # under /english/ (or /eng/, /en/) — the resolver often
+                        # returns the JAPANESE root, whose report pages (株主
+                        # 通信 / 有報) never link the English tanshin, so the
+                        # results leg sees zero candidates (MUFG live run
+                        # 2026-07-16: mufg.jp root → no results docs → 20-F
+                        # fallback). It can also return a DEEP English subpage
+                        # (Fast Retailing 2026-07-17: cached /eng/ir/stockinfo/
+                        # description.html — the crawl never reached the IR
+                        # library with the tanshin). Probe the conventional
+                        # English IR entries and crawl there when one exists;
+                        # fall back to the resolved URL. Only skip probing when
+                        # the URL already IS an English root / IR top.
+                        import requests as _rq
+                        from urllib.parse import urlparse as _up
+                        _pr = _up(_url)
+                        _path = (_pr.path or "").rstrip("/")
+                        _at_entry = re.fullmatch(
+                            r"/(?:english|eng|en)(?:/ir)?", _path) is not None
+                        if _pr.netloc and not _at_entry:
+                            for _cand in (
+                                    f"{_pr.scheme}://{_pr.netloc}/english/ir/",
+                                    f"{_pr.scheme}://{_pr.netloc}/eng/ir/",
+                                    f"{_pr.scheme}://{_pr.netloc}/en/ir/",
+                                    f"{_pr.scheme}://{_pr.netloc}/english/",
+                                    f"{_pr.scheme}://{_pr.netloc}/eng/"):
+                                try:
+                                    _pv = _rq.get(
+                                        _cand, timeout=8, allow_redirects=True,
+                                        headers={"User-Agent": "Mozilla/5.0"})
+                                    if _pv.status_code == 200:
+                                        print(f"[{job_id}] jp bs: English IR "
+                                              f"entry {_cand}", flush=True)
+                                        _url = _cand
+                                        break
+                                except Exception:
+                                    continue
                     _sink["ir_url"] = _url
                     _out = _F.fetch_reports(
                         _url, allow_fc=True,
                         annual_path=str(_annual_pdf), interim_path=str(_interim_pdf),
-                        name=_jp_name or "", early_sink=_sink)
+                        name=_jp_name or "", early_sink=_sink,
+                        purpose=("balance_sheet" if _bs_mode else "options"),
+                        results_path=(str(_results_pdf) if _bs_mode else None))
                     _out["ir_url"] = _url
                     _out["resolver_confidence"] = _res.get("confidence")
+                    # Remember the entry URL only when the crawl actually
+                    # yielded a report — a dud URL must never be cached.
+                    if any(_out.get(k) for k in ("results", "annual", "interim")):
+                        _ir_url_cache_put(_jp_ticker, _jp_name, "Japan", _url)
                     return _out
 
                 _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -661,12 +769,13 @@ def run_extraction_pipeline(job_id: str):
                     _scr = _ex.submit(_jp_scrape_both)
                     _r = _scr.result(timeout=EU_IR_SCRAPER_TIMEOUT_SEC)
                 except concurrent.futures.TimeoutError:
-                    # Scraper over the cap — salvage the early-saved annual if
-                    # the crawl had already secured one (Kawasaki: the 73pp
-                    # annual passed, then 3 interim probes blew the budget).
-                    # No interim fallback in that case.
-                    if _sink.get("annual"):
-                        _r = {"annual": _sink["annual"], "interim": None,
+                    # Scraper over the cap — salvage the early-saved results
+                    # doc or annual if the crawl had already secured one
+                    # (Kawasaki: the 73pp annual passed, then 3 interim probes
+                    # blew the budget). No interim fallback in that case.
+                    if _sink.get("annual") or _sink.get("results"):
+                        _r = {"annual": _sink.get("annual"), "interim": None,
+                              "results": _sink.get("results"),
                               "ir_url": _sink.get("ir_url")}
                 except Exception:
                     pass  # scraper failed; fall back to EDINET
@@ -680,15 +789,33 @@ def run_extraction_pipeline(job_id: str):
                 if _r:
                     _ann = (_r or {}).get("annual")
                     _intm = (_r or {}).get("interim")
+                    _resd = (_r or {}).get("results")
 
-                    # Pick the primary doc: prefer the annual; else the interim.
+                    # Pick the primary doc: quarterly-cadence results doc first
+                    # (only ever set in _bs_mode); else the annual; else the
+                    # interim. Balance-sheet jobs (user rule 2026-07-17:
+                    # always the most recent quarterly/interim) rank the
+                    # interim ABOVE the annual unless the annual is strictly
+                    # newer; options jobs keep annual-first (interim reports
+                    # often carry no SBC note).
                     _primary = None        # (path, kind, fiscal_year)
-                    _alt = None            # interim kept as the opt-in fallback
-                    if _ann and _annual_pdf.exists() and _annual_pdf.stat().st_size > 0:
+                    _alt = None            # runner-up kept as the opt-in fallback
+                    _ann_ok = bool(_ann and _annual_pdf.exists()
+                                   and _annual_pdf.stat().st_size > 0)
+                    _intm_ok = bool(_intm and _interim_pdf.exists()
+                                    and _interim_pdf.stat().st_size > 0)
+                    if _resd and _results_pdf.exists() and _results_pdf.stat().st_size > 0:
+                        _primary = (_results_pdf, "results", _resd.get("fiscal_year"))
+                    elif (_bs_mode and _ann_ok and _intm_ok
+                          and (_intm.get("fiscal_year") or 0)
+                          >= (_ann.get("fiscal_year") or 0)):
+                        _primary = (_interim_pdf, "interim", _intm.get("fiscal_year"))
+                        _alt = (_annual_pdf, "annual", _ann.get("fiscal_year"))
+                    elif _ann_ok:
                         _primary = (_annual_pdf, "annual", _ann.get("fiscal_year"))
-                        if _intm and _interim_pdf.exists() and _interim_pdf.stat().st_size > 0:
+                        if _intm_ok:
                             _alt = (_interim_pdf, "interim", _intm.get("fiscal_year"))
-                    elif _intm and _interim_pdf.exists() and _interim_pdf.stat().st_size > 0:
+                    elif _intm_ok:
                         _primary = (_interim_pdf, "interim", _intm.get("fiscal_year"))
 
                     if _primary:
@@ -706,6 +833,8 @@ def run_extraction_pipeline(job_id: str):
                             "jp_path": "ir_scraper",
                             "ir_url": (_r or {}).get("ir_url"),
                             "form": ("Annual Report" if _pkind == "annual"
+                                     else "Financial Results"
+                                     if _pkind == "results"
                                      else "Interim/Quarterly Report"),
                             "report_period": _pyear,
                             "report_year": _pyear,
@@ -721,10 +850,36 @@ def run_extraction_pipeline(job_id: str):
                             duration=time.time() - stage_start, cost=0,
                             details=(f"{meta.get('company', '?')} · IR scraper · "
                                      f"{meta['form']}"
-                                     + (" (+interim available)" if _alt else "")))
+                                     + (f" (+{_alt[1]} available)" if _alt else "")))
                         jp_ok = True
 
-            # Step B: EDINET fallback — only when an EDINET_API_KEY is configured
+            # Step B: SEC EDGAR fallback — Japanese ADR filers (MUFG, Toyota,
+            # Sony, ...) file an English 20-F with the full consolidated
+            # balance sheet, while the IR site often surfaces only the
+            # integrated report (summary tables, no statements — MUFG's
+            # ir2025_all_en.pdf). Name-verified inside _attempt_edgar, so a
+            # 4-digit TSE code can never match the wrong EDGAR entity.
+            if not jp_ok:
+                try:
+                    info = diamond_route._attempt_edgar(
+                        _jp_name, _jp_ticker, pdf_path,
+                        meta.get("category", "annual"), None)
+                    if info and pdf_path.exists() and pdf_path.stat().st_size > 0:
+                        try:
+                            JOBS[job_id]["file_size"] = pdf_path.stat().st_size
+                        except Exception:
+                            pass
+                        meta = {**meta, **info, "jp_path": "edgar"}
+                        JOBS[job_id]["source_meta"] = meta
+                        _mark_stage(job_id, "jp_fetch",
+                                    duration=time.time() - stage_start, cost=0,
+                                    details=(f"{info.get('company','?')} · "
+                                             f"SEC EDGAR · {info.get('form','?')}"))
+                        jp_ok = True
+                except Exception:
+                    pass  # not an ADR filer / no match; fall through to EDINET
+
+            # Step C: EDINET fallback — only when an EDINET_API_KEY is configured
             # (EDINET's listing + PDF download both need it) AND an EDINET code was
             # resolved (best-effort, by the endpoint). Without a key it's skipped.
             if not jp_ok:
@@ -738,7 +893,12 @@ def run_extraction_pipeline(job_id: str):
                     try:
                         info = fetch_jp_filing_as_pdf(
                             company_number=_edinet_code,
-                            category=meta.get("category", "annual"),
+                            # Balance-sheet jobs (user rule 2026-07-17) take
+                            # the freshest statement filing — annual (120) OR
+                            # semi-annual (160); EDINET has no quarterly
+                            # reports since April 2024.
+                            category=("latest" if job.get("fetch_only")
+                                      else meta.get("category", "annual")),
                             out_pdf_path=pdf_path,
                             company_name=_jp_name or meta.get("title"),
                             scan_progress=_scan_cb_jp,
@@ -762,9 +922,10 @@ def run_extraction_pipeline(job_id: str):
                         pass
                 if not jp_ok:
                     raise RuntimeError(
-                        "Could not find an annual report for this Japanese company "
-                        "on its investor-relations site. Please use the Upload tab "
-                        "to submit the PDF directly.")
+                        "Could not find an annual (or quarterly results) report "
+                        "for this Japanese company on its investor-relations "
+                        "site, SEC EDGAR (ADR 20-F), or EDINET. Please use the "
+                        "Upload tab to submit the PDF directly.")
 
         # ── Optional Stage 0 (KR): Korea / DART fetch + OCR ────────
         if job.get("source") == "korea":
@@ -1014,21 +1175,43 @@ def run_extraction_pipeline(job_id: str):
                 import concurrent.futures
                 _annual_pdf = job_dir / f"{pdf_stem}_annual.pdf"
                 _interim_pdf = job_dir / f"{pdf_stem}_interim.pdf"
+                _results_pdf = job_dir / f"{pdf_stem}_results.pdf"
+                # QUARTERLY-FIRST (balance-sheet / fetch-only jobs, user rule
+                # 2026-07-16, same as the Japan branch): prefer the freshest
+                # quarterly-cadence results doc that carries a real balance
+                # sheet; annual stays the fallback. Options runs (not
+                # fetch_only) keep annual-first.
+                _bs_mode = bool(job.get("fetch_only"))
 
                 def _eu_scrape_both():
                     from prototypes import ir_resolve_proto as _R
                     from prototypes import ir_fetch_proto as _F
-                    _res = _R.resolve(_ir_name or "", _ir_ticker or "", "",
-                                      _ir_country or "")
+                    _cached_url = _ir_url_cache_get(_ir_ticker, _ir_name,
+                                                    _ir_country)
+                    if _cached_url:
+                        print(f"[{job_id}] eu: IR URL from cache "
+                              f"{_cached_url}", flush=True)
+                        _res = {"chosen_url": _cached_url,
+                                "confidence": "CACHED"}
+                    else:
+                        _res = _R.resolve(_ir_name or "", _ir_ticker or "", "",
+                                          _ir_country or "")
                     _url = _res.get("chosen_url")
                     if not _url:
                         raise RuntimeError("IR-scraper: could not resolve an IR site")
                     _out = _F.fetch_reports(
                         _url, allow_fc=True,
                         annual_path=str(_annual_pdf), interim_path=str(_interim_pdf),
-                        name=_ir_name or "")
+                        name=_ir_name or "",
+                        purpose=("balance_sheet" if _bs_mode else "options"),
+                        results_path=(str(_results_pdf) if _bs_mode else None))
                     _out["ir_url"] = _url
                     _out["resolver_confidence"] = _res.get("confidence")
+                    # Remember the entry URL only when the crawl actually
+                    # yielded a report — a dud URL must never be cached.
+                    if any(_out.get(k) for k in ("results", "annual", "interim")):
+                        _ir_url_cache_put(_ir_ticker, _ir_name, _ir_country,
+                                          _url)
                     return _out
 
                 _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -1037,15 +1220,33 @@ def run_extraction_pipeline(job_id: str):
                     _r = _scr.result(timeout=EU_IR_SCRAPER_TIMEOUT_SEC)
                     _ann = (_r or {}).get("annual")
                     _intm = (_r or {}).get("interim")
+                    _resd = (_r or {}).get("results")
 
-                    # Pick the primary doc: prefer the annual; else the interim.
+                    # Pick the primary doc: quarterly-cadence results doc first
+                    # (only ever set in _bs_mode); else the annual; else the
+                    # interim. Balance-sheet jobs (user rule 2026-07-17:
+                    # always the most recent quarterly/interim) rank the
+                    # interim ABOVE the annual unless the annual is strictly
+                    # newer; options jobs keep annual-first (interim reports
+                    # often carry no SBC note).
                     _primary = None        # (path, kind, fiscal_year)
-                    _alt = None            # interim kept as the opt-in fallback
-                    if _ann and _annual_pdf.exists() and _annual_pdf.stat().st_size > 0:
+                    _alt = None            # runner-up kept as the opt-in fallback
+                    _ann_ok = bool(_ann and _annual_pdf.exists()
+                                   and _annual_pdf.stat().st_size > 0)
+                    _intm_ok = bool(_intm and _interim_pdf.exists()
+                                    and _interim_pdf.stat().st_size > 0)
+                    if _resd and _results_pdf.exists() and _results_pdf.stat().st_size > 0:
+                        _primary = (_results_pdf, "results", _resd.get("fiscal_year"))
+                    elif (_bs_mode and _ann_ok and _intm_ok
+                          and (_intm.get("fiscal_year") or 0)
+                          >= (_ann.get("fiscal_year") or 0)):
+                        _primary = (_interim_pdf, "interim", _intm.get("fiscal_year"))
+                        _alt = (_annual_pdf, "annual", _ann.get("fiscal_year"))
+                    elif _ann_ok:
                         _primary = (_annual_pdf, "annual", _ann.get("fiscal_year"))
-                        if _intm and _interim_pdf.exists() and _interim_pdf.stat().st_size > 0:
+                        if _intm_ok:
                             _alt = (_interim_pdf, "interim", _intm.get("fiscal_year"))
-                    elif _intm and _interim_pdf.exists() and _interim_pdf.stat().st_size > 0:
+                    elif _intm_ok:
                         _primary = (_interim_pdf, "interim", _intm.get("fiscal_year"))
 
                     if _primary:
@@ -1063,6 +1264,8 @@ def run_extraction_pipeline(job_id: str):
                             "eu_path": "ir_scraper",
                             "ir_url": (_r or {}).get("ir_url"),
                             "form": ("Annual Report" if _pkind == "annual"
+                                     else "Financial Results"
+                                     if _pkind == "results"
                                      else "Interim/Quarterly Report"),
                             "report_period": _pyear,
                             "report_year": _pyear,
@@ -1078,7 +1281,7 @@ def run_extraction_pipeline(job_id: str):
                             duration=time.time() - stage_start, cost=0,
                             details=(f"{meta.get('company', '?')} · IR scraper · "
                                      f"{meta['form']}"
-                                     + (" (+interim available)" if _alt else "")))
+                                     + (f" (+{_alt[1]} available)" if _alt else "")))
                         ir_ok = True
                 except concurrent.futures.TimeoutError:
                     pass  # scraper too slow; fall back to ESEF
@@ -1787,6 +1990,9 @@ def run_extraction_pipeline(job_id: str):
                     log=lambda m: print(f"[diamond {job_id}] {m}", file=sys.stderr),
                     country=(meta.get("country") or "").strip(),
                     allow_edgar_fallback=not meta.get("no_edgar_fallback", False),
+                    # Balance-sheet / fetch-only jobs: quarterly-first — prefer the
+                    # most recent quarterly/interim report over the annual (user rule).
+                    bs_mode=bool(job.get("fetch_only")),
                 )
             except Exception as e:
                 raise RuntimeError(f"Diamond fetch failed: {e}") from e
@@ -2512,6 +2718,68 @@ async def extract_from_mexico(
             "category": payload.category or "annual",
             "country": "Mexico",
             # Mirror Singapore: locked to BMV issuers — never fall back to US SEC EDGAR.
+            "no_edgar_fallback": True,
+        },
+    )
+    background_tasks.add_task(run_extraction_pipeline, job_id)
+
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "filename": filename,
+        "source": "diamond",
+        "company_name": company_name,
+        "ticker": ticker,
+    }
+
+
+class AustraliaExtractRequest(BaseModel):
+    # Australia (ASX): company name + ticker. Country is forced to "Australia"
+    # server-side; the ticker is auto-prefixed with "ASX:" for the scraper.
+    company_name: Optional[str] = ""
+    ticker: Optional[str] = ""
+    category: Optional[str] = "annual"
+
+
+@app.post("/api/extract-from-australia", tags=["Markets — Asia"])
+async def extract_from_australia(
+    payload: AustraliaExtractRequest,
+    background_tasks: BackgroundTasks,
+):
+    """🇦🇺 Australia (ASX): company name + ticker. Uses the SAME scraper framework as
+    Diamond (universal IR-scraper) but locked to Australia — country is fixed to
+    "Australia" and the ticker is auto-prefixed with "ASX:" for scraping/resolution
+    (e.g. the user enters BHP -> internally ASX:BHP). Mirrors the Singapore/Mexico
+    tabs; the US-EDGAR fallback is disabled so a name match never returns an
+    unrelated US filer."""
+    company_name = (payload.company_name or "").strip()
+    raw_ticker = (payload.ticker or "").strip()
+    if not company_name and not raw_ticker:
+        raise HTTPException(
+            status_code=400, detail="company_name or ticker is required"
+        )
+
+    # Prefix the ASX exchange code for the scraper (BHP -> ASX:BHP), unless the
+    # user already typed an ASX: prefix.
+    if raw_ticker and not raw_ticker.upper().startswith("ASX:"):
+        ticker = f"ASX:{raw_ticker}"
+    else:
+        ticker = raw_ticker
+
+    label = _safe_filename_part(ticker or company_name)
+    filename = f"{label}_AUSTRALIA.pdf"
+
+    job_id = create_job(
+        filename=filename,
+        file_size=0,
+        source="diamond",
+        source_meta={
+            "company_name": company_name,
+            "ticker": ticker,
+            "category": payload.category or "annual",
+            "country": "Australia",
+            # Mirror Singapore/Mexico: locked to ASX issuers — never fall back to
+            # US SEC EDGAR (a name match there would fetch an unrelated US filer).
             "no_edgar_fallback": True,
         },
     )
@@ -3525,6 +3793,7 @@ _OPTIONS_COUNTRY_TO_SOURCE = {
     "germany": "germany",
     "singapore": "singapore",
     "mexico": "mexico",
+    "australia": "australia",
 }
 
 # Exchange prefixes seen in "EXCHANGE:TICKER" inputs (GuruFocus / Capital IQ /
@@ -3568,6 +3837,8 @@ _TICKER_EXCHANGE_PREFIX_TO_COUNTRY = {
     "SGX": "Singapore",
     # Mexico
     "BMV": "Mexico", "MEX": "Mexico",
+    # Australia
+    "ASX": "Australia",
     # Denmark
     "CPH": "Denmark", "OMXC": "Denmark",
     # EU/EEA (ESEF)
@@ -3729,6 +4000,14 @@ _BS_EU_PROMPT_COUNTRIES = _OPTIONS_EU_COUNTRIES | {
     "denmark", "switzerland", "europe", "eu",
 }
 
+# Countries that file under AASB (IFRS) but get their OWN Stage-3 prompt
+# (Balance_sheet/prompt_au.py) so Australia-specific tuning never affects the
+# European/IFRS prompt. The AU prompt started as a byte-identical copy of the
+# EU one, so today's output is unchanged. Checked BEFORE the EU set below.
+_BS_AU_PROMPT_COUNTRIES = {
+    "australia",
+}
+
 
 def _route_options_request(payload, edgar_default_form: str = "10-K"):
     """Shared routing for the unified endpoints: validate {ticker, company_name,
@@ -3762,7 +4041,7 @@ def _route_options_request(payload, edgar_default_form: str = "10-K"):
                 f"Unsupported country {country!r}. Supported: United States, Canada, "
                 "United Kingdom, Denmark, Japan, South Korea, China, Hong Kong, "
                 "Taiwan, India, Indonesia, Israel, Malaysia, Thailand, Brazil, "
-                "Germany, Singapore, Mexico, and EU/EEA member states."
+                "Germany, Singapore, Mexico, Australia, and EU/EEA member states."
             ),
         )
 
@@ -3786,6 +4065,7 @@ def _route_options_request(payload, edgar_default_form: str = "10-K"):
         "germany": (extract_from_germany, GermanyExtractRequest),
         "singapore": (extract_from_singapore, SingaporeExtractRequest),
         "mexico": (extract_from_mexico, MexicoExtractRequest),
+        "australia": (extract_from_australia, AustraliaExtractRequest),
         "eu": (extract_from_eu, EuExtractRequest),
     }
     handler, Model = dispatch[source]
@@ -4157,20 +4437,30 @@ BS_JOB_TTL_SECONDS = 30 * 60
 # ── Balance-sheet result cache (user request 2026-07-15) ─────────────
 # Same durable store as the options excel endpoint (core/excel_cache: NeonDB,
 # disk fallback) — the "balance-sheet-v1" prefix keeps the keys separate inside
-# the shared table. A repeat request with the SAME ticker + company_name within
-# the TTL is served from cache: no fetch, no LlamaParse, no LLM. Only
-# successful results are cached; pass {"refresh": true} to force a fresh run.
+# the shared table. A repeat request with the SAME ticker within the TTL is
+# served from cache: no fetch, no LlamaParse, no LLM. Only successful results
+# are cached; pass {"refresh": true} to force a fresh run.
+# ENABLED with a 24h default (user request 2026-07-18); override with the
+# BS_CACHE_TTL_SECONDS env var (0 disables — the guard stays at the call sites:
+# excel_cache.get treats ttl<=0 as "never expires", NOT as "disabled").
 BS_CACHE_TTL_SECONDS = int(os.environ.get("BS_CACHE_TTL_SECONDS", 24 * 3600))
 
 
 def _bs_cache_key(payload: "FetchFilingRequest"):
-    """Cache key = normalized ticker + company_name (both must match to hit).
-    Returns None (caching skipped) when both are blank."""
-    ticker = (payload.ticker or "").strip().upper()
+    """Cache key = TICKER only (same ticker within the TTL hits, regardless of
+    company_name) — mirrors the options result cache. An "EXCHANGE:" prefix is
+    stripped so ASX:CUV and CUV key identically. Falls back to company_name only
+    when no ticker is supplied; returns None (caching skipped) when both blank."""
+    raw = (payload.ticker or "").strip()
+    if ":" in raw:                       # ASX:CUV -> CUV (venue prefix dropped)
+        raw = raw.split(":", 1)[1]
+    ticker = raw.strip().upper()
+    if ticker:
+        return ("balance-sheet-v1", ticker)
     name = " ".join((payload.company_name or "").strip().lower().split())
-    if not ticker and not name:
-        return None
-    return ("balance-sheet-v1", ticker, name)
+    if name:
+        return ("balance-sheet-v1", "name:" + name)
+    return None
 
 # Hard references to in-flight tasks — asyncio only keeps weak refs, so an
 # unreferenced task can be garbage-collected mid-run.
@@ -4204,8 +4494,10 @@ async def _bs_run_job(bs_job_id: str, payload: FetchFilingRequest):
         _, _bs_country = _normalize_ticker_and_country(
             payload.ticker, payload.country, payload.company_name
         )
-        region = ("eu" if (_bs_country or "").strip().lower()
-                  in _BS_EU_PROMPT_COUNTRIES else None)
+        _bs_c = (_bs_country or "").strip().lower()
+        region = ("au" if _bs_c in _BS_AU_PROMPT_COUNTRIES
+                  else "eu" if _bs_c in _BS_EU_PROMPT_COUNTRIES
+                  else None)
 
         # The pipeline itself never crashes — failures come back as JSON with
         # "warnings" (and an "error" field), passed through inside the result.
@@ -4228,6 +4520,19 @@ async def _bs_run_job(bs_job_id: str, payload: FetchFilingRequest):
                 f"available from this source for this company."
             )
 
+        # Quarterly-first rule (user, 2026-07-17): the balance sheet must come
+        # from the most recent quarterly/interim report; an annual filing is
+        # only the last-resort fallback and is flagged, never silently used.
+        _form = str(_meta.get("form") or "")
+        if isinstance(result, dict) and re.search(
+                r"annual|10-K|20-F|40-F|有価証券報告書", _form, re.IGNORECASE):
+            result.setdefault("warnings", []).append(
+                f"Report type: balance sheet taken from an ANNUAL filing "
+                f"({_form}) — no more-recent quarterly/interim report was "
+                f"found on the IR site or registry fallbacks; figures are "
+                f"as of the fiscal year-end."
+            )
+
         # ── Evidence PDF (user request 2026-07-09): save the located
         # balance-sheet pages, highlighted, to HareRam/. Best-effort — the
         # job result is never affected by an evidence failure.
@@ -4242,16 +4547,16 @@ async def _bs_run_job(bs_job_id: str, payload: FetchFilingRequest):
             print(f"[{bs_job_id}] BS evidence PDF skipped: {_ev_exc}",
                   flush=True)
 
-        # ── 24h result cache write: successful results only (an "error"
-        # field means a stage failed — always re-run those). excel_cache.set
-        # is best-effort and never raises.
-        if not result.get("error"):
+        # ── Result cache write (only when BS_CACHE_TTL_SECONDS > 0):
+        # successful results only (an "error" field means a stage failed —
+        # always re-run those). excel_cache.set is best-effort, never raises.
+        if BS_CACHE_TTL_SECONDS > 0 and not result.get("error"):
             _ckey = _bs_cache_key(payload)
             if _ckey:
                 from core import excel_cache
                 excel_cache.set(_ckey, result)
                 print(f"[{bs_job_id}] BS result cached "
-                      f"(key={_ckey[1]!r}+{_ckey[2]!r}, "
+                      f"(key={_ckey[1]!r}, "
                       f"ttl={BS_CACHE_TTL_SECONDS}s)", flush=True)
 
         BS_JOBS[bs_job_id] = {"status": "done", "result": result,
@@ -4281,12 +4586,13 @@ async def balance_sheet_standardize(payload: FetchFilingRequest):
     LLM standardize + tally all run in the background (logic unchanged).
     Poll GET /api/balance-sheet/status?job_id=<id> for the result.
 
-    Result cache: a successful result is cached (NeonDB, disk fallback) keyed
-    by ticker + company_name for BS_CACHE_TTL_SECONDS (default 24h). A repeat
-    request within the TTL returns a job that is ALREADY done — the first
-    status poll delivers the full result instantly with "served_from_cache":
-    true (no fetch, no LlamaParse, no LLM). Failures are never cached. Pass
-    {"refresh": true} to bypass and overwrite the cached entry."""
+    Result cache: ENABLED with a 24h TTL by default (override with the
+    BS_CACHE_TTL_SECONDS env var; 0 disables). A successful result is cached
+    (NeonDB, disk fallback) keyed by TICKER only — a repeat request with the
+    same ticker within the TTL returns a job that is ALREADY done, and the
+    first status poll delivers the full result instantly with
+    "served_from_cache": true (no fetch, no LlamaParse, no LLM). Failures are
+    never cached. Pass {"refresh": true} to bypass and overwrite the entry."""
     # Validate the body up front (400 on missing/unsupported input) — pure
     # routing check, no job created, nothing fetched.
     _route_options_request(payload, edgar_default_form="LATEST")
@@ -4295,17 +4601,17 @@ async def balance_sheet_standardize(payload: FetchFilingRequest):
 
     bs_job_id = uuid.uuid4().hex
 
-    # ── 24h result cache read: on a hit the job is born "done", so the
-    # client's normal poll loop gets the result on its first call — no
-    # client change needed. refresh=true skips the read (fresh run then
-    # overwrites the entry).
-    _ckey = _bs_cache_key(payload)
+    # ── Result cache read (only when BS_CACHE_TTL_SECONDS > 0): on a hit
+    # the job is born "done", so the client's normal poll loop gets the
+    # result on its first call — no client change needed. refresh=true
+    # skips the read (fresh run then overwrites the entry).
+    _ckey = _bs_cache_key(payload) if BS_CACHE_TTL_SECONDS > 0 else None
     if _ckey and not payload.refresh:
         from core import excel_cache
         _hit = excel_cache.get(_ckey, BS_CACHE_TTL_SECONDS)
         if isinstance(_hit, dict):
             print(f"[{bs_job_id}] BS cache HIT "
-                  f"(key={_ckey[1]!r}+{_ckey[2]!r})", flush=True)
+                  f"(key={_ckey[1]!r})", flush=True)
             BS_JOBS[bs_job_id] = {
                 "status": "done",
                 "result": {**_hit, "served_from_cache": True},
@@ -4315,11 +4621,11 @@ async def balance_sheet_standardize(payload: FetchFilingRequest):
                                 content={"job_id": bs_job_id,
                                          "status": "done"})
         print(f"[{bs_job_id}] BS cache MISS "
-              f"(key={_ckey[1]!r}+{_ckey[2]!r}) — running full pipeline",
+              f"(key={_ckey[1]!r}) — running full pipeline",
               flush=True)
     elif _ckey and payload.refresh:
         print(f"[{bs_job_id}] BS cache BYPASSED (refresh=true, "
-              f"key={_ckey[1]!r}+{_ckey[2]!r}) — running full pipeline",
+              f"key={_ckey[1]!r}) — running full pipeline",
               flush=True)
 
     BS_JOBS[bs_job_id] = {"status": "pending", "created": time.time()}

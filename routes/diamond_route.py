@@ -221,7 +221,7 @@ def _attempt_eu(name, ticker, out, cat, prog):
     return {**info, "diamond_source": "eu"}
 
 
-def _attempt_irscraper(name, ticker, out, cat, prog, country=None):
+def _attempt_irscraper(name, ticker, out, cat, prog, country=None, bs_mode=False):
     from prototypes import ir_resolve_proto as R
     from prototypes import ir_fetch_proto as F
     res = R.resolve(name or "", ticker or "", "", country or "")
@@ -235,6 +235,53 @@ def _attempt_irscraper(name, ticker, out, cat, prog, country=None):
                 f"Refusing to extract from a possibly-wrong company — "
                 f"try the per-market tab or the Upload tab.")
         raise RuntimeError("IR-scraper: could not resolve an IR site")
+
+    if bs_mode:
+        # QUARTERLY-FIRST (balance-sheet flow, user rule): one IR-page crawl
+        # captures the latest quarterly-cadence results doc, interim, and annual;
+        # prefer results > interim (unless the annual is strictly newer) > annual
+        # (last resort). Mirrors the Japan/EU picker in backend.run_extraction_pipeline.
+        outp = Path(out)
+        stem = str(outp.with_suffix(""))
+        annual_path, interim_path, results_path = (
+            f"{stem}_annual.pdf", f"{stem}_interim.pdf", f"{stem}_results.pdf")
+        r = F.fetch_reports(
+            ir_url, allow_fc=True, annual_path=annual_path,
+            interim_path=interim_path, name=name or "",
+            purpose="balance_sheet", results_path=results_path)
+        _ann, _intm, _resd = r.get("annual"), r.get("interim"), r.get("results")
+
+        def _ok(d, p):
+            return bool(d and Path(p).exists() and Path(p).stat().st_size > 0)
+
+        _ann_ok, _intm_ok = _ok(_ann, annual_path), _ok(_intm, interim_path)
+        chosen = None  # (path, kind, fiscal_year)
+        if _ok(_resd, results_path):
+            chosen = (results_path, "results", _resd.get("fiscal_year"))
+        elif (_ann_ok and _intm_ok
+              and (_intm.get("fiscal_year") or 0) >= (_ann.get("fiscal_year") or 0)):
+            chosen = (interim_path, "interim", _intm.get("fiscal_year"))
+        elif _ann_ok:
+            chosen = (annual_path, "annual", _ann.get("fiscal_year"))
+        elif _intm_ok:
+            chosen = (interim_path, "interim", _intm.get("fiscal_year"))
+        if not chosen:
+            raise RuntimeError(
+                f"IR-scraper: no gate-passing quarterly/interim/annual report "
+                f"at {ir_url}")
+        cpath, ckind, cfy = chosen
+        if Path(cpath) != outp:
+            import shutil
+            shutil.copy2(cpath, out)
+        if not _valid_pdf(outp):
+            raise RuntimeError(f"IR-scraper: no valid report PDF at {ir_url}")
+        form = ("Annual Report" if ckind == "annual"
+                else "Financial Results" if ckind == "results"
+                else "Interim/Quarterly Report")
+        return {"company": name, "form": form, "report_period": cfy,
+                "ir_url": ir_url, "resolver_confidence": res.get("confidence"),
+                "diamond_source": "ir_scraper"}
+
     out_result = F.fetch_annual_report(ir_url, allow_fc=True, save_path=str(out), name=name or "")
     if not out_result or not _valid_pdf(Path(out)):
         raise RuntimeError(f"IR-scraper: no gate-passing annual report at {ir_url}")
@@ -272,6 +319,7 @@ def fetch_for_diamond(
     log: Optional[Callable[[str], None]] = None,
     country: Optional[str] = None,
     allow_edgar_fallback: bool = True,
+    bs_mode: bool = False,
 ) -> dict:
     """COUNTRY-ROUTED Diamond (per user request):
       1. If the user-supplied `country` maps to a DEDICATED data-API source
@@ -320,7 +368,8 @@ def fetch_for_diamond(
     try:
         if out.exists():
             out.unlink()
-        info = _attempt_irscraper(company_name, ticker, out, category, progress, hint)
+        info = _attempt_irscraper(company_name, ticker, out, category, progress,
+                                  hint, bs_mode=bs_mode)
         say("OK via ir_scraper")
         return info
     except Exception as e:

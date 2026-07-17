@@ -52,6 +52,25 @@ _INTERIM_NAME_RE = (r"interim|half[- ]?year|\bh[12]\b|\bq[1-4]\b|quarter|"
                     r"six months|nine months|three months|"
                     r"半年|中期|季度|季報|季报")
 
+# quarterly-cadence financial-RESULTS documents (JP tanshin "(Consolidated)
+# Summary Report", "Financial Results", "Financial Highlights" decks) — used
+# by fetch_reports(purpose="balance_sheet") to pick the freshest results doc
+# carrying a balance sheet. Like the interim leg they are picked by NAME (the
+# doc-type rubric scores them negative); the content gate is BS-oriented
+# (recent + a real balance-sheet page), NOT SBC-oriented — results docs carry
+# no share-based-payment note. Statement-class names (tanshin/summary/results
+# — full consolidated statements) outrank deck-class names (highlights /
+# chart-slide summaries of the same period): MUFG's summary2603_en.pdf (63pp,
+# real Consolidated Balance Sheets) beats highlights2603_en.pdf (24pp slide).
+_RESULTS_STATEMENT_RE = (r"summary report|financial results|business results|"
+                         r"results announcement|earnings report|tanshin|"
+                         r"決算短信|短信|決算")
+_RESULTS_NAME_RE = (_RESULTS_STATEMENT_RE +
+                    r"|financial highlights|\bhighlights?\b|financial summary")
+# deck-word demotion inside the results ranking: a "Financial Results
+# Presentation" is a slide deck even though it name-matches the statement class.
+_RESULTS_DECK_RE = r"presentation|slides?\b|deck|databook|highlight"
+
 # share-based-payment terms (subset of keywords.py) — acceptance probe (EN + CJK)
 SBC_TERMS = [
     "share-based payment", "share based payment", "stock option", "share option",
@@ -94,6 +113,37 @@ _BS_ASSETS_MARKERS = [
     "total assets", "total current assets", "total de l'actif", "total actif",
     "資產總額", "资产总额", "總資產", "总资产", "資產合計", "资产合计", "資産合計",
 ]
+# Junk-page rejection — mirrors Stage 1 exactly. Multi-year summaries
+# (MUFG's integrated report prints "Balance sheet data:" + "Total assets" on
+# its Ten-Year Summary page and carries NO real statement anywhere) and
+# non-title wording ("Balance sheet data:", "Average balance sheets",
+# "off-balance sheet") must not make a document pass the probe.
+try:
+    from Balance_sheet.pdf_locator import (_looks_like_multiyear_summary,
+                                           _title_match)
+except Exception:  # standalone run without the Balance_sheet package on path
+    _YEAR_TOKEN_RE = re.compile(r"\b(?:fy\s?)?(20\d{2})\b")
+
+    def _looks_like_multiyear_summary(text: str) -> bool:
+        years = sorted({int(m.group(1))
+                        for m in _YEAR_TOKEN_RE.finditer(text)})
+        best = run = 1 if years else 0
+        for prev, cur in zip(years, years[1:]):
+            run = run + 1 if cur == prev + 1 else 1
+            best = max(best, run)
+        return best >= 5
+
+    def _title_match(text: str, variants: list) -> "str | None":
+        for v in variants:
+            for m in re.finditer(re.escape(v), text):
+                tail = text[m.end():m.end() + 10].lstrip(" \n:—-*")
+                if tail.startswith(("data", "date")):
+                    continue
+                head = text[max(0, m.start() - 12):m.start()].rstrip(" \n-")
+                if head.endswith(("average", "off")):
+                    continue
+                return v
+        return None
 
 
 def _fold_text(text: str) -> str:
@@ -112,8 +162,10 @@ def _has_balance_sheet_page(doc: "fitz.Document") -> bool:
     n = doc.page_count
     for i in range(n):
         text = _fold_text(doc[i].get_text())
-        if not any(v in text for v in variants):
+        if _title_match(text, variants) is None:
             continue
+        if _looks_like_multiyear_summary(text):
+            continue  # summary table, not the statement (Stage 1 skips it too)
         window = text + ("\n" + _fold_text(doc[i + 1].get_text())
                          if i + 1 < n else "")
         if any(m in window for m in _BS_ASSETS_MARKERS):
@@ -465,9 +517,12 @@ def _download_pdf(url: str, referer: str) -> tuple[bytes, str]:
 
 
 def inspect_pdf(url: str, referer: str, save_path: str | None = None,
-                force_save: bool = False) -> dict:
+                force_save: bool = False, bs_probe: bool = False) -> dict:
     """Download + open; report pages, text-layer, and SBC-term hits (Stage-1 stand-in).
-    If save_path is given and the bytes are a real PDF, write them to disk."""
+    If save_path is given and the bytes are a real PDF, write them to disk.
+    `bs_probe`: balance-sheet-purpose probing — compute `has_balance_sheet`
+    even for short docs with zero SBC hits (JP tanshin / financial-highlights
+    results docs never mention share-based payments; some tanshin run <20pp)."""
     data, why = _download_pdf(url, referer)
     if not data and "+" in urlparse(url).path:
         # Jahia/AEM-style CMSes store files with literal spaces (%20); some
@@ -535,6 +590,43 @@ def inspect_pdf(url: str, referer: str, save_path: str | None = None,
             r"[\s\S]{0,40}?(?<!\d)((?:20)\d{2})(?!\d)",
             sample) if 2000 <= int(y) <= CURRENT_YEAR + 1]
         fiscal_year = max(period_years) if period_years else None
+    bs_fresh = None
+    if bs_probe:
+        # Results docs (JP tanshin) print NEXT-year forecast dates on the
+        # cover ("Dividends for the fiscal year ENDING March 31, 2027") that
+        # inflate the bare max-year read — prefer the reporting-period year
+        # ("for the fiscal year/three months ENDED March 31, 2026"). "ended"
+        # only, so forecast "ending" phrases never match. bs_probe-scoped:
+        # options-path probing is untouched.
+        ended_years = [int(y) for y in re.findall(
+            r"ended[\s\S]{0,40}?(?<!\d)((?:20)\d{2})(?!\d)", cover)
+            if 2000 <= int(y) <= CURRENT_YEAR + 1]
+        if ended_years:
+            fiscal_year = max(ended_years)
+        # FRESHNESS: a quarterly-cadence doc is only useful if it's newer than
+        # what the annual would carry — Sanofi's "Half-year financial report
+        # 2025" (period Jun 30 2025) passed the bare FY floor and DISPLACED
+        # the FY2025 annual (period Dec 31 2025), serving 6-months-staler
+        # data. Latest full date on the cover (period end or publication —
+        # both track recency; "March 31, 2026" and "30 June 2025" orders)
+        # must be within ~9 months; anything older is superseded by a fresher
+        # results doc or the annual. None (no parseable date) → caller falls
+        # back to a strict current-year floor.
+        import datetime as _dt
+        _MONTHS = {m: i + 1 for i, m in enumerate(
+            ["january", "february", "march", "april", "may", "june", "july",
+             "august", "september", "october", "november", "december"])}
+        _mon_re = "|".join(_MONTHS)
+        _dates = [(int(y), _MONTHS[mo], int(d)) for mo, d, y in re.findall(
+            rf"({_mon_re})\s+(\d{{1,2}}),?\s+((?:20)\d{{2}})", cover)]
+        _dates += [(int(y), _MONTHS[mo], int(d)) for d, mo, y in re.findall(
+            rf"(\d{{1,2}})\s+({_mon_re})\s+((?:20)\d{{2}})", cover)]
+        _dates = [d for d in _dates
+                  if 2000 <= d[0] <= CURRENT_YEAR + 1 and 1 <= d[2] <= 31]
+        if _dates:
+            y, m, d = max(_dates)
+            bs_fresh = ((_dt.date.today() - _dt.date(y, m, min(d, 28))).days
+                        <= 280)
     # gate: a usable filing is LONG, mentions SBC, and is EITHER an annual report (10-K)
     # OR a RECENT (current/last-FY) quarterly/interim report. Per user: not restricted to
     # annual reports — a recent 2026 quarterly (10-Q) is acceptable too. An OLD interim
@@ -552,6 +644,10 @@ def inspect_pdf(url: str, referer: str, save_path: str | None = None,
     # so _passes_interim always sees a computed value, not None.
     has_bs = None
     if len(hits) >= 1 and n >= 20 and year_ok:
+        has_bs = _has_balance_sheet_page(doc)
+    elif bs_probe and n >= 6 and year_ok:
+        # balance-sheet purpose: the SBC/pages preconditions above never hold
+        # for results docs — compute the (only) check that matters for them.
         has_bs = _has_balance_sheet_page(doc)
     accept = (len(hits) >= 2 and n >= 40 and year_ok and bool(has_bs)
               and ((not is_interim) or is_annual or recent))
@@ -575,7 +671,7 @@ def inspect_pdf(url: str, referer: str, save_path: str | None = None,
     return {"ok": True, "pages": n, "bytes": len(data), "saved": saved,
             "text_layer": len(sample) > 500, "sbc_hits": hits,
             "is_interim": is_interim, "is_annual": is_annual, "fiscal_year": fiscal_year,
-            "has_balance_sheet": has_bs,
+            "has_balance_sheet": has_bs, "bs_fresh": bs_fresh,
             "stage1_would_accept": accept, "gate_note": note}
 
 
@@ -692,7 +788,9 @@ def fetch_annual_report(ir_url: str, allow_fc: bool = True, save_path: str | Non
 
 def fetch_reports(ir_url: str, allow_fc: bool = True, annual_path: str | None = None,
                   interim_path: str | None = None, max_downloads: int = 10,
-                  name: str = "", early_sink: dict | None = None) -> dict:
+                  name: str = "", early_sink: dict | None = None,
+                  purpose: str = "options",
+                  results_path: str | None = None) -> dict:
     """Like fetch_annual_report, but captures BOTH the latest annual report AND the
     latest recent interim/quarterly report from the SAME single IR-page crawl. Used by
     the EU tab so that, if the annual report turns out to have no share-based-payment
@@ -714,6 +812,16 @@ def fetch_reports(ir_url: str, allow_fc: bool = True, annual_path: str | None = 
     during it, the caller can salvage the already-saved annual from the sink
     instead of discarding a successful fetch (Kawasaki: the 73pp annual
     passed, then interim probes blew the budget).
+
+    `purpose="balance_sheet"` + `results_path`: quarterly-first mode for the
+    balance-sheet flow (user rule 2026-07-16: quarterly report first, then
+    annual). The quarterly-cadence financial-results docs (_RESULTS_NAME_RE)
+    are probed FIRST with a BS-content gate (recent + real balance-sheet
+    page — no SBC requirement); the first passer is saved to `results_path`,
+    returned under out["results"] (and early_sink["results"]), and the
+    annual/interim probing is SKIPPED — the caller keeps its own
+    annual/EDGAR/EDINET fallback chain. When no results doc passes, the flow
+    falls through to the normal annual-first behavior unchanged.
     """
     ranked_all = find_report_pdfs(ir_url, allow_fc)
     # Annual candidates: positive-scored (have an annual/FS doc-type signal).
@@ -729,6 +837,72 @@ def fetch_reports(ir_url: str, allow_fc: bool = True, annual_path: str | None = 
     passers, downloads, seen, probed = [], 0, set(), {}
     recent = CURRENT_YEAR - 1
     early_annual: dict | None = None
+
+    # 0) BALANCE-SHEET purpose: probe quarterly-cadence results docs first
+    #    (see docstring). Statement-class names (tanshin/summary/results)
+    #    outrank deck-class (highlights/presentation) so a full consolidated
+    #    balance sheet beats a chart-slide summary of the same period; the
+    #    _has_balance_sheet_page gate rejects decks whose "summary slide"
+    #    carries no real statement title (Kawasaki-style presentations).
+    if purpose == "balance_sheet" and results_path:
+        # Candidates: results-named (JP tanshin/highlights) PLUS interim-named
+        # (EU quarterlies are anchored "Q1 2026", "half-year report", "press
+        # release ... first-quarter results" — no "financial results" wording).
+        # The BS-content gate below decides; a news press release without a
+        # balance sheet is rejected in one cheap probe.
+        res_cands = [r for r in ranked_all
+                     if re.search(_RESULTS_NAME_RE + "|" + _INTERIM_NAME_RE,
+                                  (str(r[2]) + " " + str(r[1])).lower())]
+
+        def _res_rank(r):
+            blob = (str(r[2]) + " " + str(r[1])).lower()
+            tier = (2 if re.search(_RESULTS_DECK_RE, blob)
+                    else 0 if re.search(_RESULTS_STATEMENT_RE, blob) else 1)
+            return (tier, -(_pdf_year(r[1], r[2]) or 0), -r[0])
+
+        res_cands.sort(key=_res_rank)
+        res_probes = 0
+        for sc, u, a in res_cands:
+            if res_probes >= 5 or downloads >= max_downloads:
+                break
+            if u in seen:
+                continue
+            seen.add(u)
+            info = inspect_pdf(u, ir_url, bs_probe=True)
+            probed[u] = info
+            downloads += 1
+            res_probes += 1
+            fresh = (info.get("bs_fresh") is True
+                     # no parseable cover date: strict current-year floor
+                     # (a bare FY >= last-year floor let Sanofi's H1-2025
+                     # report displace the fresher FY2025 annual)
+                     or (info.get("bs_fresh") is None
+                         and (info.get("fiscal_year") or 0) >= CURRENT_YEAR))
+            ok = (bool(info.get("ok"))
+                  and (info.get("fiscal_year") or 0) >= recent
+                  and (info.get("pages") or 0) >= 6
+                  and bool(info.get("has_balance_sheet"))
+                  and fresh)
+            tag = (f"OK {info.get('pages')}pp FY{info.get('fiscal_year')}"
+                   if ok else
+                   "reject: " + ("stale period (superseded results doc)"
+                                 if (bool(info.get("ok"))
+                                     and info.get("has_balance_sheet")
+                                     and not fresh)
+                                 else str(info.get("gate_note")
+                                          or info.get("reason") or "?")))
+            print(f"    results [{sc:+.0f}] {tag}  {u[:70]}")
+            if ok:
+                # re-download with save: results docs never pass inspect_pdf's
+                # strict save gate, so persist explicitly (like the interim leg).
+                info = inspect_pdf(u, ir_url, save_path=results_path,
+                                   force_save=True, bs_probe=True)
+                res = {"url": u, "fiscal_year": info.get("fiscal_year"),
+                       "info": info, "path": results_path}
+                if early_sink is not None:
+                    early_sink["results"] = res
+                return {"annual": None, "interim": None, "results": res,
+                        "ir_url": ir_url}
 
     def _secure_annual():
         # Save the newest RECENT annual as soon as one has passed the gate (see
@@ -836,7 +1010,8 @@ def fetch_reports(ir_url: str, allow_fc: bool = True, annual_path: str | None = 
     annuals = sorted([p for p in passers if p[1] == 1], reverse=True)
     interims = sorted([p for p in passers if p[1] == 0], reverse=True)
 
-    out: dict = {"annual": None, "interim": None, "ir_url": ir_url}
+    out: dict = {"annual": None, "interim": None, "results": None,
+                 "ir_url": ir_url}
     if early_annual is not None:
         # Already saved at pass time — reuse; never rewrite (see _secure_annual).
         out["annual"] = early_annual

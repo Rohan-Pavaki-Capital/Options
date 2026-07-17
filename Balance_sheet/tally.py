@@ -166,11 +166,34 @@ def _side_tolerance(result: dict, side: str) -> float:
     return tally_tolerance(mapped, result["filing_totals"][f"total_{side}"])
 
 
-def _diagnose_side(result: dict, side: str) -> dict:
+def _find_missing_negative_line(side: str, line_items: list, gap: float,
+                                tolerance: float):
+    """An over-count with NO bucket matching the gap is very often a printed
+    NEGATIVE contra line the model dropped — Japanese-GAAP filings print
+    "Allowance for credit losses" as a negative asset line, and omitting -X
+    leaves the sum over by exactly X. Return (label, value) of the printed
+    negative line on this side whose magnitude ~= the gap, or None."""
+    side_tag = "ASSET" if side == "assets" else "LIABILITY"
+    best = None
+    for label, value in line_items:
+        tag, core, _cnc = _parse_item_label(label)
+        if value >= 0 or tag not in (side_tag, ""):  # untagged: either side
+            continue
+        distance = abs(abs(value) - gap)
+        if distance <= tolerance and (best is None or distance < best[0]):
+            best = (distance, core, value)
+    if best:
+        return best[1], best[2]
+    return None
+
+
+def _diagnose_side(result: dict, side: str, line_items: list | None = None) -> dict:
     """Explain an unbalanced side. gap > 0 (over-count) is the double-count
     signature: look for a SPECIFIC bucket whose value ~= the gap — that line
-    was almost certainly also folded into an other_* bucket. gap < 0 means a
-    line was simply not mapped."""
+    was almost certainly also folded into an other_* bucket. If no bucket
+    matches, check the printed line items for a NEGATIVE line ~= -gap (a
+    dropped contra line, e.g. a Japanese bank's allowance for credit losses).
+    gap < 0 means a line was simply not mapped."""
     tally_d = result["tally"]
     gap = tally_d[f"sum_{side}"] - result["filing_totals"][f"total_{side}"]
     diagnosis = {
@@ -194,13 +217,21 @@ def _diagnose_side(result: dict, side: str) -> dict:
         if best:
             diagnosis["likely_double_counted_bucket"] = best[1]
             diagnosis["bucket_value"] = best[2]
+        else:
+            neg = _find_missing_negative_line(side, line_items or [],
+                                              gap, tolerance)
+            if neg:
+                diagnosis["type"] = "missing_negative"
+                diagnosis["missing_negative_label"] = neg[0]
+                diagnosis["missing_negative_value"] = neg[1]
     return diagnosis
 
 
-def run_tally(result: dict) -> dict:
+def run_tally(result: dict, line_items: list | None = None) -> dict:
     """Sum buckets + memo per side, compare to the printed filing totals
     within the rounding-aware tolerance, set booleans. Unbalanced sides get
-    a structured diagnosis in tally["diagnosis"]."""
+    a structured diagnosis in tally["diagnosis"]; the printed line_items
+    (when available) let the diagnosis spot a dropped NEGATIVE contra line."""
     sum_assets = _sum_assets(result)
     sum_liabilities = _sum_liabilities(result)
     totals = result["filing_totals"]
@@ -215,9 +246,9 @@ def run_tally(result: dict) -> dict:
     }
     diagnoses = []
     if not result["tally"]["assets_balanced"]:
-        diagnoses.append(_diagnose_side(result, "assets"))
+        diagnoses.append(_diagnose_side(result, "assets", line_items))
     if not result["tally"]["liabilities_balanced"]:
-        diagnoses.append(_diagnose_side(result, "liabilities"))
+        diagnoses.append(_diagnose_side(result, "liabilities", line_items))
     if diagnoses:
         result["tally"]["diagnosis"] = diagnoses
 
@@ -273,7 +304,21 @@ def build_gap_message(result: dict) -> str:
             "memo_excluded field" if side == "assets"
             else "long-term debt → memo_excluded.long_term_debt"
         )
-        if diag["type"] == "double_count":
+        if diag["type"] == "missing_negative":
+            neg_label = diag["missing_negative_label"]
+            neg_value = diag["missing_negative_value"]
+            parts.append(
+                f"{label} over by {gap:,} (buckets + memo sum to {sum_v:,} vs "
+                f"printed {printed_label} {printed:,}). The filing prints a "
+                f"NEGATIVE line '{neg_label}' = {neg_value:,} (a contra line, "
+                f"e.g. allowance for credit losses / reserve) that was NOT "
+                f"included in any bucket — omitting it leaves the side over by "
+                f"exactly its magnitude. Append {neg_value:,} as a negative "
+                f"term to the ' + ' chain of the bucket holding the related "
+                f"printed line (if unclear, use {other_hint}). Keep every "
+                f"other value unchanged. Return corrected JSON."
+            )
+        elif diag["type"] == "double_count":
             closest = (diag["likely_double_counted_bucket"]
                        or _closest_bucket_to_gap(result, side, gap))
             if closest:
@@ -334,7 +379,15 @@ def add_unbalanced_warnings(result: dict) -> dict:
             f"{tally[f'sum_{side}']:,} vs printed total {side} "
             f"{totals[f'total_{side}']:,} (gap {gap:+,}). "
         )
-        if diag["type"] == "double_count" and diag["likely_double_counted_bucket"]:
+        if diag["type"] == "missing_negative":
+            text += (
+                f"Over by {gap:,} == printed NEGATIVE line "
+                f"'{diag['missing_negative_label']}' "
+                f"({diag['missing_negative_value']:,}) that was never mapped - "
+                f"a contra line (e.g. allowance for credit losses) must be "
+                f"included as a negative term in its related bucket."
+            )
+        elif diag["type"] == "double_count" and diag["likely_double_counted_bucket"]:
             text += (
                 f"Over by {gap:,} ~= {diag['likely_double_counted_bucket']} "
                 f"({diag['bucket_value']:,}); likely double-counted in other_* - "
@@ -610,3 +663,48 @@ def normalize_to_millions(result: dict) -> dict:
         f"original scale recorded in original_unit_label."
     )
     return result
+
+
+def attach_debt_summary(result: dict) -> dict:
+    """Add a top-level `debt` object summarizing interest-bearing debt already
+    captured elsewhere in the result — a REPORTING rollup, not a move. It
+    mirrors the existing fields (which stay where they are):
+      short_term_debt <- liabilities.current.debt
+      long_term_debt  <- memo_excluded.long_term_debt
+      total_debt      == short_term_debt + long_term_debt
+    A missing/None/0 source defaults to 0, and total_debt still computes. No
+    number is re-parsed from the filing — the values are copied verbatim from
+    the already-mapped output. Run LAST (after normalize_to_millions) so debt
+    mirrors the same scaled values the rest of the output carries.
+
+    Returns a NEW dict with `debt` placed after `memo_excluded` and before
+    `filing_totals`; every other field is copied through unchanged in order."""
+    def _num(v):
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+    short_term = _num(result.get("liabilities", {}).get("current", {}).get("debt"))
+    long_term = _num(result.get("memo_excluded", {}).get("long_term_debt"))
+    debt = {
+        "short_term_debt": short_term,
+        "long_term_debt": long_term,
+        "total_debt": short_term + long_term,
+    }
+
+    # Rebuild preserving key order: debt sits right after memo_excluded, or —
+    # if that block is absent (error paths) — just before filing_totals, else
+    # appended. Any stale debt copy is dropped so the call is idempotent.
+    ordered: dict = {}
+    inserted = False
+    for key, value in result.items():
+        if key == "debt":
+            continue
+        if key == "filing_totals" and not inserted:
+            ordered["debt"] = debt
+            inserted = True
+        ordered[key] = value
+        if key == "memo_excluded" and not inserted:
+            ordered["debt"] = debt
+            inserted = True
+    if not inserted:
+        ordered["debt"] = debt
+    return ordered

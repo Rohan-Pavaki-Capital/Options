@@ -172,6 +172,7 @@ export default function UploadScreen({
   onFetchGermany,
   onFetchSingapore,
   onFetchMexico,
+  onFetchAustralia,
   onFetchSimple,
   onFetchTest,
   uploading,
@@ -210,6 +211,8 @@ export default function UploadScreen({
         <SingaporePanel onFetchSingapore={onFetchSingapore} uploading={uploading} />
       ) : mode === 'mexico' ? (
         <MexicoPanel onFetchMexico={onFetchMexico} uploading={uploading} />
+      ) : mode === 'australia' ? (
+        <AustraliaPanel onFetchAustralia={onFetchAustralia} uploading={uploading} />
       ) : SIMPLE_MARKETS[mode] ? (
         <SourcePanel cfg={SIMPLE_MARKETS[mode]} onFetchSimple={onFetchSimple} uploading={uploading} />
       ) : null}
@@ -668,6 +671,89 @@ function MexicoPanel({ onFetchMexico, uploading }) {
       <div className="panel-foot">
         BMV-listed companies · The ticker is used as <span className="font-mono">BMV:&lt;code&gt;</span> (e.g.
         WALMEX → BMV:WALMEX). Fetches from the company's own investor-relations site —
+        best-effort for issuers whose site serves a downloadable annual report.
+      </div>
+    </form>
+  )
+}
+
+function AustraliaPanel({ onFetchAustralia, uploading }) {
+  const [companyName, setCompanyName] = useState('')
+  const [ticker, setTicker] = useState('')
+
+  // Either field is enough; both is best for disambiguation.
+  const canSubmit = (companyName.trim().length > 0 || ticker.trim().length > 0) && !uploading
+
+  const handleSubmit = useCallback((e) => {
+    e?.preventDefault?.()
+    if (!canSubmit) return
+    onFetchAustralia({
+      company_name: companyName.trim(),
+      ticker: ticker.trim(),
+    })
+  }, [companyName, ticker, canSubmit, onFetchAustralia])
+
+  return (
+    <form
+      onSubmit={handleSubmit}
+      className={`
+        max-w-xl mx-auto panel p-7
+        ${uploading ? 'opacity-60 pointer-events-none' : ''}
+      `}
+    >
+      <PanelHead
+        eyebrow="Australia · ASX"
+        title="Australia"
+        desc="Enter the company name and ASX ticker. We retrieve the latest annual report from the company's investor-relations site and extract the share-based payment disclosures."
+      />
+
+      <GuruFocusLink
+        uploading={uploading}
+        expectCountry="Australia"
+        onApply={(g) => onFetchAustralia({ company_name: g.company_name || '', ticker: g.ticker || '' })}
+      />
+
+      <div className="grid grid-cols-2 gap-3 mb-5">
+        <div>
+          <label className="field-label">
+            Company name
+          </label>
+          <input
+            type="text"
+            value={companyName}
+            onChange={(e) => setCompanyName(e.target.value)}
+            placeholder="BHP Group"
+            disabled={uploading}
+            className="field-input"
+          />
+        </div>
+        <div>
+          <label className="field-label">
+            ASX ticker
+          </label>
+          <input
+            type="text"
+            value={ticker}
+            onChange={(e) => setTicker(e.target.value)}
+            placeholder="BHP"
+            disabled={uploading}
+            className="field-input"
+          />
+        </div>
+      </div>
+
+      <button
+        type="submit"
+        disabled={!canSubmit}
+        className="btn btn-primary w-full justify-center"
+      >
+        {uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+        {uploading ? 'Finding report…' : 'Fetch & extract'}
+      </button>
+
+      <div className="panel-foot">
+        ASX-listed companies · The ticker is used as <span className="font-mono">ASX:&lt;code&gt;</span> (e.g.
+        BHP → ASX:BHP). Fetches from the company's own investor-relations site —
         best-effort for issuers whose site serves a downloadable annual report.
       </div>
     </form>
