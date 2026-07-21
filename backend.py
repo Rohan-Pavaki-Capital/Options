@@ -5131,6 +5131,22 @@ if _CREDIT_ROUTE.is_file():
         app.include_router(_credit_mod.router)
 
 
+# ─── Operating margin route (standalone feature, same origin) ──────
+# Adds POST /api/operating-margin — LLM-judged target pre-tax operating
+# margin (EBIT % of sales, year 10) + convergence year for the DCF
+# workbook. The space in the "Operating Margine" folder name rules out a
+# normal import, so the module is loaded from its file path.
+import importlib.util as _margin_ilu
+
+_MARGIN_ROUTE = Path(__file__).parent / "Operating Margine" / "margin_route.py"
+if _MARGIN_ROUTE.is_file():
+    _margin_spec = _margin_ilu.spec_from_file_location("margin_route", str(_MARGIN_ROUTE))
+    _margin_mod = _margin_ilu.module_from_spec(_margin_spec)
+    _margin_spec.loader.exec_module(_margin_mod)
+    if getattr(_margin_mod, "router", None) is not None:
+        app.include_router(_margin_mod.router)
+
+
 # ─── Serve the built React frontend (single-origin) ────────────────
 # Mounted AFTER all /api routes so the API always takes precedence.
 from fastapi.staticfiles import StaticFiles
