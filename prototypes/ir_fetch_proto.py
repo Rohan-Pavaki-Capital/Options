@@ -50,6 +50,9 @@ _UA_CHROME = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 _INTERIM_NAME_RE = (r"interim|half[- ]?year|\bh[12]\b|\bq[1-4]\b|quarter|"
                     r"first[- ]quarter|second[- ]quarter|third[- ]quarter|"
                     r"six months|nine months|three months|"
+                    # Indonesian: "Laporan Triwulan" (quarterly report) — BCA
+                    # links its quarterly financial reports that way.
+                    r"triwulan|kuartal|"
                     r"半年|中期|季度|季報|季报")
 
 # quarterly-cadence financial-RESULTS documents (JP tanshin "(Consolidated)
@@ -69,7 +72,11 @@ _RESULTS_NAME_RE = (_RESULTS_STATEMENT_RE +
                     r"|financial highlights|\bhighlights?\b|financial summary")
 # deck-word demotion inside the results ranking: a "Financial Results
 # Presentation" is a slide deck even though it name-matches the statement class.
-_RESULTS_DECK_RE = r"presentation|slides?\b|deck|databook|highlight"
+# Pillar-3 / risk-exposure & capital reports (BCA: "laporan eksposur risiko dan
+# permodalan" sits beside each quarterly) are regulatory capital disclosures,
+# never the statement source — demoted the same way.
+_RESULTS_DECK_RE = (r"presentation|slides?\b|deck|databook|highlight|"
+                    r"pillar ?3|risk exposure|eksposur|basel")
 
 # share-based-payment terms (subset of keywords.py) — acceptance probe (EN + CJK)
 SBC_TERMS = [
@@ -190,9 +197,10 @@ POS = [
     (r"綜合財務報表|合併財務報表|财务报表|財務報表|財務報告|财务报告", 34),
 ]
 NEG = [
-    # interim — incl. compact forms Q3FY26 / FY26Q3 / 3Q26
+    # interim — incl. compact forms Q3FY26 / FY26Q3 / 3Q26, Indonesian "triwulan"
     (r"interim|half-?year|\bquarter|first quarter|third quarter|6 months|"
-     r"\bq[1-4]\b|q[1-4]\s*fy|fy\s*\d{2}\s*q[1-4]|[1-4]q\d{2}|q[1-4]\d{2}|q[1-4]fy", 45),
+     r"\bq[1-4]\b|q[1-4]\s*fy|fy\s*\d{2}\s*q[1-4]|[1-4]q\d{2}|q[1-4]\d{2}|q[1-4]fy|"
+     r"triwulan|kuartal", 45),
     (r"\bmd&?a\b|management discussion", 25),                 # MD&A alone is not the statements
     (r"tender|offer to purchase|prospectus|supplement", 40),
     (r"esg|sustainab|\bcsr\b|climate|carbon|diversity|impact report", 45),
@@ -222,6 +230,11 @@ REPORTS_PAGE = [
     (r"financial[- ]?(?:results?|information)", 24),
     (r"ir[- ]?library|\blibrary\b", 14),
     (r"financials\b", 20), (r"\bfilings?\b", 16), (r"reports?\b", 10), (r"investor", 6),
+    # Indonesian IR sections (BCA: "Hubungan Investor" hub with "Laporan
+    # Keuangan" / "Laporan Tahunan" listing pages) — without these the crawl
+    # never follows past the homepage and the report PDFs stay invisible.
+    (r"laporan[- _]?keuangan", 30), (r"laporan[- _]?tahunan", 26),
+    (r"\blaporan\b", 10), (r"hubungan[- _]?investor", 6),
 ]
 # steer the crawl AWAY from interim/news pages when picking which sub-page to follow
 REPORTS_PAGE_NEG = [
@@ -373,6 +386,28 @@ def _year_in(s: str) -> int | None:
     for m in re.findall(r"fy\s*'?(\d{2,4})", s):
         yrs.append(2000 + int(m) if len(m) == 2 else int(m))
     return max(yrs) if yrs else None
+
+
+def _url_stamp(u: str, anchor: str = "") -> int:
+    """YYYYMMDD upload stamp in the path/anchor (CMS filename prefixes like
+    "20260423-financial-report-march-2026.pdf") — a sharper recency key than
+    the bare year, which ties a March-2026 quarterly with the December-2025
+    one sitting in the same /2026/ folder. 0 when absent."""
+    blob = unquote(urlparse(u).path) + " " + anchor
+    stamps = [int(s) for s in
+              re.findall(r"(?<!\d)(20\d{2}[01]\d[0-3]\d)(?!\d)", blob)]
+    return max(stamps, default=0)
+
+
+def _quarterly_rank(u: str, anchor: str = ""):
+    """Sort key (ascending) for quarterly-candidate probing in the
+    balance-sheet search fallback: results/interim-NAMED non-deck docs first,
+    then newest by filename date stamp, then by year."""
+    blob = (anchor + " " + unquote(urlparse(u).path)).lower()
+    named = bool(re.search(_RESULTS_NAME_RE + "|" + _INTERIM_NAME_RE, blob))
+    deck = bool(re.search(_RESULTS_DECK_RE, blob))
+    tier = 0 if (named and not deck) else (1 if named else 2)
+    return (tier, -_url_stamp(u, anchor), -(_year_in(blob) or 0))
 
 
 def score_pdf(url: str, anchor: str) -> float:
@@ -690,20 +725,35 @@ def _registrable(host: str) -> str:
     return ".".join(parts[-2:]) if len(parts) >= 2 else host.lower()
 
 
-def _search_candidate_pdfs(ir_url: str, name: str = "", limit: int = 8) -> list[str]:
+def _search_candidate_pdfs(ir_url: str, name: str = "", limit: int = 8,
+                           kind: str = "annual") -> list[str]:
     """Web-search FALLBACK for opaque IR platforms (Q4 Inc /static-files/<uuid>, JS-only
     listings) where the crawler's filename scorer finds no PDF. Search the issuer's OWN
-    domain for the annual report and return URLs to probe by CONTENT (inspect_pdf decides).
+    domain for the report and return URLs to probe by CONTENT (inspect_pdf decides).
     Stays within Diamond's scraper-only design: restricted to the issuer's own registrable
-    domain — no SEC/EDGAR or third-party hosts."""
+    domain — no SEC/EDGAR or third-party hosts.
+
+    `kind="quarterly"`: quarterly-oriented queries for the balance-sheet flow's
+    quarterly-first rule — the annual queries can never surface a quarterly
+    (BCA: the crawl was blind to the JS/Indonesian IR pages and the annual-only
+    search then served a year-stale balance sheet). Includes an Indonesian
+    "laporan keuangan triwulan" query; on non-Indonesian domains it just
+    returns nothing."""
     reg = _registrable(urlparse(ir_url).netloc)
     if not reg:
         return []
     queries = []
-    if name:
-        queries.append(f"{name} annual report filetype:pdf")
-    queries += [f"site:{reg} annual report pdf",
-                f"site:{reg} annual report filetype:pdf"]
+    if kind == "quarterly":
+        if name:
+            queries.append(f"{name} quarterly financial report filetype:pdf")
+        queries += [f"site:{reg} quarterly report pdf",
+                    f"site:{reg} interim financial statements pdf",
+                    f"site:{reg} laporan keuangan triwulan pdf"]
+    else:
+        if name:
+            queries.append(f"{name} annual report filetype:pdf")
+        queries += [f"site:{reg} annual report pdf",
+                    f"site:{reg} annual report filetype:pdf"]
     try:
         from ddgs import DDGS
     except Exception:
@@ -820,8 +870,11 @@ def fetch_reports(ir_url: str, allow_fc: bool = True, annual_path: str | None = 
     page — no SBC requirement); the first passer is saved to `results_path`,
     returned under out["results"] (and early_sink["results"]), and the
     annual/interim probing is SKIPPED — the caller keeps its own
-    annual/EDGAR/EDINET fallback chain. When no results doc passes, the flow
-    falls through to the normal annual-first behavior unchanged.
+    annual/EDGAR/EDINET fallback chain. When the CRAWL surfaces no passing
+    results doc, a quarterly-oriented own-domain web search
+    (_search_candidate_pdfs kind="quarterly") is probed with the same gate
+    first; only when that also fails does the flow fall through to the
+    normal annual-first behavior unchanged.
     """
     ranked_all = find_report_pdfs(ir_url, allow_fc)
     # Annual candidates: positive-scored (have an annual/FS doc-type signal).
@@ -858,20 +911,23 @@ def fetch_reports(ir_url: str, allow_fc: bool = True, annual_path: str | None = 
             blob = (str(r[2]) + " " + str(r[1])).lower()
             tier = (2 if re.search(_RESULTS_DECK_RE, blob)
                     else 0 if re.search(_RESULTS_STATEMENT_RE, blob) else 1)
-            return (tier, -(_pdf_year(r[1], r[2]) or 0), -r[0])
+            # filename date stamp before bare year: a March-2026 quarterly and
+            # the December-2025 one share the same /2026/ folder (= same year).
+            return (tier, -_url_stamp(r[1], str(r[2])),
+                    -(_pdf_year(r[1], r[2]) or 0), -r[0])
 
         res_cands.sort(key=_res_rank)
-        res_probes = 0
-        for sc, u, a in res_cands:
-            if res_probes >= 5 or downloads >= max_downloads:
-                break
+
+        def _try_results(u, sc, label=""):
+            """Probe ONE results/quarterly candidate with the BS content gate;
+            returns the saved result dict when it passes, else None."""
+            nonlocal downloads
             if u in seen:
-                continue
+                return None
             seen.add(u)
             info = inspect_pdf(u, ir_url, bs_probe=True)
             probed[u] = info
             downloads += 1
-            res_probes += 1
             fresh = (info.get("bs_fresh") is True
                      # no parseable cover date: strict current-year floor
                      # (a bare FY >= last-year floor let Sanofi's H1-2025
@@ -891,18 +947,84 @@ def fetch_reports(ir_url: str, allow_fc: bool = True, annual_path: str | None = 
                                      and not fresh)
                                  else str(info.get("gate_note")
                                           or info.get("reason") or "?")))
-            print(f"    results [{sc:+.0f}] {tag}  {u[:70]}")
-            if ok:
-                # re-download with save: results docs never pass inspect_pdf's
-                # strict save gate, so persist explicitly (like the interim leg).
-                info = inspect_pdf(u, ir_url, save_path=results_path,
-                                   force_save=True, bs_probe=True)
-                res = {"url": u, "fiscal_year": info.get("fiscal_year"),
-                       "info": info, "path": results_path}
-                if early_sink is not None:
-                    early_sink["results"] = res
-                return {"annual": None, "interim": None, "results": res,
-                        "ir_url": ir_url}
+            print(f"    results{label} [{sc:+.0f}] {tag}  {u[:70]}")
+            if not ok:
+                return None
+            # re-download with save: results docs never pass inspect_pdf's
+            # strict save gate, so persist explicitly (like the interim leg).
+            info = inspect_pdf(u, ir_url, save_path=results_path,
+                               force_save=True, bs_probe=True)
+            return {"url": u, "fiscal_year": info.get("fiscal_year"),
+                    "info": info, "path": results_path}
+
+        res = None
+        res_probes = 0
+        for sc, u, a in res_cands:
+            if res_probes >= 5 or downloads >= max_downloads:
+                break
+            before = downloads
+            res = _try_results(u, sc)
+            res_probes += downloads - before
+            if res:
+                break
+        # SEARCH FALLBACK (quarterly): the crawl surfaced no acceptable
+        # results doc — search the issuer's own domain for quarterly/interim
+        # reports and probe by content with the SAME gate. Without this the
+        # quarterly-first rule silently degrades to annual whenever the IR
+        # listing is JS-rendered or non-English (BCA: "Laporan Triwulan"
+        # pages invisible to the crawl; the annual-only search fallback then
+        # served a year-stale balance sheet).
+        if res is None and downloads < max_downloads:
+            q_urls = _search_candidate_pdfs(ir_url, name, kind="quarterly")
+            # Direct PDF hits, PLUS PDFs harvested from LISTING-page hits: the
+            # search often lands on the quarterly listing page rather than the
+            # PDF itself (BCA's "Laporan Keuangan" page holds the March-2026
+            # report none of the queries surface directly) — harvesting it is
+            # one cheap fetch. Only results/interim-NAMED PDF links are kept
+            # from a listing (BCA's page also lists ~60 monthly/ESG docs).
+            cands = [(u, "") for u in q_urls
+                     if re.search(r"\.pdf(\?|$)", u, re.I)]
+            pages = [u for u in q_urls
+                     if not re.search(r"\.pdf(\?|$)", u, re.I)
+                     and re.search(r"laporan|keuangan|report|financial|"
+                                   r"investor|quarterly|interim|results",
+                                   u, re.I)]
+            for pu in pages[:2]:
+                try:
+                    plinks, _t, via = get_links(pu, allow_fc)
+                except Exception:
+                    continue
+                named = [(su, sa) for su, sa in plinks
+                         if re.search(r"\.pdf(\?|$)", su, re.I)
+                         and re.search(
+                             _RESULTS_NAME_RE + "|" + _INTERIM_NAME_RE,
+                             (sa + " " + unquote(urlparse(su).path)).lower())]
+                print(f"    [search fallback] {len(named)} quarterly-named "
+                      f"PDFs via {via} on listing page {pu[:60]}")
+                cands += named
+            uniq, seen_u = [], set()
+            for u, a in cands:
+                if u not in seen_u:
+                    seen_u.add(u)
+                    uniq.append((u, a))
+            uniq.sort(key=lambda c: _quarterly_rank(c[0], c[1]))
+            if uniq:
+                print(f"    [search fallback] probing up to 5 of "
+                      f"{len(uniq)} quarterly candidates (BS gate)")
+            sq_probes = 0
+            for u, a in uniq:
+                if sq_probes >= 5 or downloads >= max_downloads:
+                    break
+                before = downloads
+                res = _try_results(u, 0, "(search)")
+                sq_probes += downloads - before
+                if res:
+                    break
+        if res is not None:
+            if early_sink is not None:
+                early_sink["results"] = res
+            return {"annual": None, "interim": None, "results": res,
+                    "ir_url": ir_url}
 
     def _secure_annual():
         # Save the newest RECENT annual as soon as one has passed the gate (see

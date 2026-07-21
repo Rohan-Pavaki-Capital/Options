@@ -16,7 +16,7 @@ import logging
 import re
 from collections import Counter
 
-from .config import (
+from ..config import (
     ASSET_CURRENT_KEYS,
     ASSET_NON_CURRENT_KEYS,
     LIABILITY_CURRENT_KEYS,
@@ -609,7 +609,12 @@ def sanity_check_other_buckets(result: dict) -> dict:
     return result
 
 
-_UNIT_FACTORS_TO_MILLIONS = {"thousands": 0.001, "millions": 1.0, "billions": 1000.0}
+_UNIT_FACTORS_TO_MILLIONS = {
+    "thousands": 0.001,
+    "millions": 1.0,
+    "billions": 1000.0,
+    "absolute": 0.000001,
+}
 
 
 def normalize_to_millions(result: dict) -> dict:
@@ -618,8 +623,8 @@ def normalize_to_millions(result: dict) -> dict:
     (a linear op) never affects reconciliation. thousands ÷ 1,000, millions
     unchanged, billions × 1,000. Exact for thousands (whole-thousand lines →
     at most 3 decimals). Original scale is recorded in original_unit_label; if
-    the scale was never identified, values are left as-is with a warning
-    (guessing the unit would be worse than being honest)."""
+    the scale was never identified, values are ASSUMED absolute and divided by
+    1,000,000 to reach millions (house rule)."""
     label = (result.get("unit_label") or "").lower()
     factor = unit_word = None
     for word, f in _UNIT_FACTORS_TO_MILLIONS.items():
@@ -627,11 +632,13 @@ def normalize_to_millions(result: dict) -> dict:
             factor, unit_word = f, word
             break
     if factor is None:
+        # House rule: no unit stated on the balance sheet -> treat the figures
+        # as absolute and convert to millions (/1,000,000).
+        factor, unit_word = _UNIT_FACTORS_TO_MILLIONS["absolute"], "absolute"
         result.setdefault("warnings", []).append(
-            "Unit scale not identified - values left in the filing's original "
-            "unit; NOT converted to millions."
+            "No unit scale stated; ASSUMED absolute and converted to millions "
+            "(/1,000,000)."
         )
-        return result
     if factor == 1.0:
         result["unit_label"] = "in millions"
         return result  # already millions — nothing to scale

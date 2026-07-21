@@ -9,7 +9,7 @@ import asyncio
 import concurrent.futures
 import logging
 
-from .config import require_llamaparse_key
+from ..config import require_llamaparse_key
 
 logger = logging.getLogger("balance_sheet.parser")
 

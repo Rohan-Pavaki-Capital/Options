@@ -9,7 +9,10 @@ import copy
 import logging
 import os
 
-from . import parser, pdf_locator, standardizer, tally
+from . import tally
+from .France import fix_grand_total_liabilities
+from .standardize import standardizer
+from .preprocessing import parser, pdf_locator
 from .config import TALLY_MAX_RETRIES, empty_result
 
 logger = logging.getLogger("balance_sheet.pipeline")
@@ -105,8 +108,9 @@ def run_markdown_pipeline(markdown: str, source_pages: list | None = None,
                 )
 
     # Stage 3 — LLM standardization into the fixed schema. region="eu"
-    # selects the European/IFRS prompt (prompt_eu.py); None/anything else
-    # keeps the existing US prompt.
+    # selects the European/IFRS prompt (prompts/prompt_eu.py); region="fr"
+    # the French prompt (France/prompt_fr.py); None/anything else keeps the
+    # existing US prompt.
     try:
         result = standardizer.standardize(markdown, region=region,
                                           page_text=page_text)
@@ -123,6 +127,24 @@ def run_markdown_pipeline(markdown: str, source_pages: list | None = None,
     result["source_pages"] = source_pages
     result.setdefault("warnings", [])
 
+    line_items = standardizer.extract_line_items(markdown,
+                                                 page_text=page_text)
+    tagged = len(line_items) >= 5  # same reliability bar as the prompt checklist
+
+    def _apply_totals(res: dict) -> None:
+        """Printed-totals override, then — France only — the 'Total passif'
+        guard (France/guard.py): a printed 'Total liabilities' EQUAL to the
+        printed 'Total assets' is the French grand total (equity +
+        liabilities), so the liabilities-only total is re-derived from
+        printed equity values before it becomes the tally target."""
+        _apply_printed_totals(res)
+        if region == "fr":
+            fix_grand_total_liabilities(
+                res, line_items,
+                printed_equity=printed_totals.get("total_equity"),
+                page_text=page_text,
+            )
+
     # Stage 4 — tally + single-count check in code, with an LLM correction
     # loop: re-prompt with the exact gap and/or the exact duplicated line,
     # re-tally, repeat until both sides balance with no chain-level
@@ -131,11 +153,7 @@ def run_markdown_pipeline(markdown: str, source_pages: list | None = None,
     # so the duplicate check can see each printed term the model used.
     raw = copy.deepcopy(result)
     tally.coerce_result_numbers(result)
-    _apply_printed_totals(result)
-
-    line_items = standardizer.extract_line_items(markdown,
-                                                 page_text=page_text)
-    tagged = len(line_items) >= 5  # same reliability bar as the prompt checklist
+    _apply_totals(result)
     # line_items ride into the tally so the diagnosis can match an over-count
     # against a printed NEGATIVE contra line (Japanese-GAAP allowance lines).
     tally.run_tally(result, line_items)
@@ -164,7 +182,7 @@ def run_markdown_pipeline(markdown: str, source_pages: list | None = None,
             retry["source_pages"] = source_pages
             retry_raw = copy.deepcopy(retry)
             tally.coerce_result_numbers(retry)
-            _apply_printed_totals(retry)
+            _apply_totals(retry)
             tally.run_tally(retry, line_items)
             result, kept = _merge_balanced_sides(result, retry, line_items)
             raw = _merge_raw_sides(raw, retry_raw, kept)
@@ -215,7 +233,8 @@ def run_markdown_pipeline(markdown: str, source_pages: list | None = None,
 
 def run_pipeline(pdf_path: str, region: str | None = None) -> dict:
     """Run the full 4-stage pipeline on a 10-Q/10-K PDF path. region="eu"
-    switches Stage 3 to the European/IFRS prompt; default keeps the US one."""
+    switches Stage 3 to the European/IFRS prompt; region="fr" to the French
+    prompt plus the 'Total passif' code guard; default keeps the US one."""
     result = empty_result()
     temp_pdf = None
     try:

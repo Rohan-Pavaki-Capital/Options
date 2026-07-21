@@ -15,7 +15,7 @@ import unicodedata
 
 import fitz  # PyMuPDF
 
-from .config import TITLE_VARIANTS
+from ..config import TITLE_VARIANTS
 
 logger = logging.getLogger("balance_sheet.pdf_locator")
 
@@ -61,6 +61,21 @@ _EQUITY_TOTAL_MARKERS = [
     "total des capitaux propres",
     "total capitaux propres",
     "capitaux propres et passif",
+    # French grand total of the equity-and-liabilities side: Bolloré's URD
+    # prints the one-page BILAN CONSOLIDÉ closing with "TOTAL PASSIF" and no
+    # "total ... capitaux propres" row at all — without this marker the real
+    # consolidated statement is demoted to an assets-only fallback and the
+    # later "Comptes sociaux" (PARENT-company, thousands-scale) bilan wins.
+    "total passif",
+    "total du passif",
+    # French liabilities-section subtotals (singular + plural): L'Oréal's
+    # bilan prints every total row as a bare "TOTAL" — the "Passifs
+    # courants" / "Passifs non courants" section rows are the only wording
+    # that proves the liabilities/equity side was captured.
+    "passif courant",
+    "passifs courants",
+    "passif non courant",
+    "passifs non courants",
 ]
 
 
@@ -159,7 +174,11 @@ def _has_statement_structure(text: str) -> bool:
     identify the page as the balance sheet (a TOC or prose cross-reference
     never carries all three)."""
     en = "current assets" in text and "current liabilities" in text
-    fr = "actif courant" in text and "passif courant" in text
+    # French singular AND plural — L'Oréal's URD prints "Actifs courants" /
+    # "Passifs courants" (plural), which the singular substrings never match
+    # (the 's' sits mid-phrase).
+    fr = (("actif courant" in text or "actifs courants" in text)
+          and ("passif courant" in text or "passifs courants" in text))
     return (en or fr) and _has_equity_total(text)
 
 
@@ -400,8 +419,9 @@ def extract_printed_totals(captured_text: str) -> dict:
     text = _fold(captured_text)
     oldest_first = _columns_oldest_first(text)
 
-    # French filings group digits with spaces ("37 825"); English with commas.
-    _NUM = r"((?:\d{1,3}(?: \d{3})+)|[\d,]{4,})"
+    # French filings group digits with spaces ("37 825"); English with commas;
+    # Indonesian with dots ("1.640.830.566").
+    _NUM = r"((?:\d{1,3}(?:[ .]\d{3})+)|[\d,]{4,})"
     _GAP = r"[^\d(]{0,40}\(?\$?\s*"
 
     def first_number_after(label_re: str):
@@ -416,7 +436,7 @@ def extract_printed_totals(captured_text: str) -> dict:
         group = m.group(1)
         if oldest_first and m.lastindex and m.lastindex >= 2 and m.group(2):
             group = m.group(2)
-        return int(group.replace(",", "").replace(" ", ""))
+        return int(group.replace(",", "").replace(" ", "").replace(".", ""))
 
     totals = {
         # "total assets" not followed by more words on the label side
@@ -433,12 +453,25 @@ def extract_printed_totals(captured_text: str) -> dict:
             or first_number_after(
                 r"total (?:des )?actifs?(?!\s+(?:non\s+)?courants?)(?!\s+de\s)")
         )
+    if totals["total_assets"] is None:
+        # Indonesian (bilingual OJK-format filings, e.g. BCA): "JUMLAH ASET" —
+        # the ENGLISH label prints AFTER the number columns in these
+        # two-language layouts, so the English attempt above never matches.
+        # Exclude the subtotals ("jumlah aset lancar/tidak lancar/produktif").
+        totals["total_assets"] = first_number_after(
+            r"jumlah aset(?!\s+(?:lancar|tidak|produktif))")
     if totals["total_liabilities"] is None:
         # French: "Total (du) passif" alone — exclude the section subtotals
         # and the L&E line "Total passif et capitaux propres".
         totals["total_liabilities"] = first_number_after(
             r"total (?:du\s+|des\s+)?passifs?(?!\s+(?:non\s+)?courants?)(?!\s+et)"
         )
+    if totals["total_liabilities"] is None:
+        # Indonesian: "JUMLAH LIABILITAS" — exclude the jangka pendek/panjang
+        # (current/non-current) subtotals and the combined L&E line "JUMLAH
+        # LIABILITAS, DANA SYIRKAH TEMPORER DAN EKUITAS".
+        totals["total_liabilities"] = first_number_after(
+            r"jumlah liabilitas(?!\s*(?:,|dan\b|jangka))")
     # Total equity — read once (labeled on most filings, including
     # fully-unlabeled ones like APA that still print "TOTAL EQUITY"). Kept so
     # the pipeline can derive total_liabilities = total_assets - total_equity
@@ -453,6 +486,10 @@ def extract_printed_totals(captured_text: str) -> dict:
         # capitaux propres et passifs".
         equity = first_number_after(
             r"total (?:des\s+)?capitaux propres(?!\s+et)")
+    if equity is None:
+        # Indonesian: "JUMLAH EKUITAS" — NOT the attributable-to-parent
+        # subtotal "Jumlah ekuitas yang dapat diatribusikan ...".
+        equity = first_number_after(r"jumlah ekuitas(?!\s+(?:yang|dan\b))")
     totals["total_equity"] = equity
 
     if totals["total_liabilities"] is None:

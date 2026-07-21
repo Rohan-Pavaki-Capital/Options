@@ -63,7 +63,7 @@ Final JSON (values in millions)
 - The AI must return strict JSON in the fixed schema (see section 3). Numbers are copied exactly as printed — only "$" and commas are stripped, values are never scaled or recalculated by the AI.
 - If several lines belong in one bucket, the AI writes them as a string like `"100 + 200"` and the **code** does the addition.
 - If the AI's output is broken (invalid JSON, missing keys, invented keys), it is asked once more to fix it. Two failures in a row = error.
-- There are **two prompts**: the default US one, and a European/IFRS one (`prompt_eu.py`) used when the caller passes `region="eu"`. The EU prompt knows IFRS habits: non-current items listed first, "Total equity and liabilities" instead of "Total liabilities", captions like "Provisions" and "Trade and other receivables", etc.
+- The prompts live in the **`prompts/` package** (`prompts/prompt_us.py` default US/other markets incl. Japan, `prompts/prompt_eu.py` for `region="eu"`, `prompts/prompt_au.py` for `region="au"`). The EU prompt knows IFRS habits: non-current items listed first, "Total equity and liabilities" instead of "Total liabilities", captions like "Provisions" and "Trade and other receivables", etc.
 
 ### Stage 4 — Tally (`tally.py`)
 
@@ -156,7 +156,9 @@ sum(liability buckets) + long_term_debt            == printed Total liabilities
 | `pdf_locator.py` | Stage 1 — finds the balance-sheet pages, exports them to a temp PDF, reads printed totals and unit label from the page text. |
 | `parser.py` | Stage 2 — sends the temp PDF to LlamaParse and returns markdown. |
 | `standardizer.py` | Stage 3 — extracts the line-item checklist in code, builds the prompt, calls the AI, validates/repairs the JSON. |
-| `prompt_eu.py` | The European/IFRS version of the Stage-3 prompt (used when `region="eu"`). |
+| `prompts/prompt_us.py` | The default Stage-3 prompt (US GAAP + all other markets, incl. Japanese GAAP). |
+| `prompts/prompt_eu.py` | The European/IFRS version of the Stage-3 prompt (used when `region="eu"`). |
+| `prompts/prompt_au.py` | The Australian/AASB version of the Stage-3 prompt (used when `region="au"`; currently identical to the EU prompt). |
 | `tally.py` | Stage 4 — math check, gap diagnosis, correction messages, safety guards, final conversion to millions. |
 | `pipeline.py` | The orchestrator — runs Stages 1→4, wires the retry loop, merges the best result when a retry fixes one side but breaks the other. |
 | `api.py` | Small standalone FastAPI app to run the pipeline on a local PDF (path or upload). |

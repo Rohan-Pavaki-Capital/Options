@@ -105,8 +105,10 @@ def resolve_company_number(
 
     rows = _load_master()
 
-    # 1) Numeric HK code → exact (zero-padded) code match.
-    if ticker and any(ch.isdigit() for ch in ticker) and not company_name:
+    # 1) Numeric HK code → exact (zero-padded) code match. The HK stock code is a
+    #    unique, authoritative identifier, so try it first even when a company_name
+    #    is also supplied (name-contains matching below is only a fallback).
+    if ticker and any(ch.isdigit() for ch in ticker):
         code_norm = _norm_code(ticker)
         if code_norm:
             for r in rows:

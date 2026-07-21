@@ -1993,6 +1993,9 @@ def run_extraction_pipeline(job_id: str):
                     # Balance-sheet / fetch-only jobs: quarterly-first — prefer the
                     # most recent quarterly/interim report over the annual (user rule).
                     bs_mode=bool(job.get("fetch_only")),
+                    # Direct-URL override: when the caller supplied an exact report
+                    # PDF link, fetch that instead of resolving/crawling the IR site.
+                    report_url=(meta.get("report_url") or "").strip() or None,
                 )
             except Exception as e:
                 raise RuntimeError(f"Diamond fetch failed: {e}") from e
@@ -3993,19 +3996,29 @@ _OPTIONS_EU_COUNTRIES = {
 
 # Countries whose filings follow the IFRS "statement of financial position"
 # presentation — the balance-sheet standardizer uses the European prompt
-# (Balance_sheet/prompt_eu.py) for these; every other country (incl. the US)
-# keeps the existing prompt.
+# (Balance_sheet/prompts/prompt_eu.py) for these; every other country (incl.
+# the US) keeps the existing prompt.
 _BS_EU_PROMPT_COUNTRIES = _OPTIONS_EU_COUNTRIES | {
     "germany", "united kingdom", "uk", "great britain", "england",
     "denmark", "switzerland", "europe", "eu",
 }
 
 # Countries that file under AASB (IFRS) but get their OWN Stage-3 prompt
-# (Balance_sheet/prompt_au.py) so Australia-specific tuning never affects the
+# (Balance_sheet/prompts/prompt_au.py) so Australia-specific tuning never affects the
 # European/IFRS prompt. The AU prompt started as a byte-identical copy of the
 # EU one, so today's output is unchanged. Checked BEFORE the EU set below.
 _BS_AU_PROMPT_COUNTRIES = {
     "australia",
+}
+
+# France gets its OWN Stage-3 prompt + code guard (Balance_sheet/France/):
+# French filers print the "Total passif" grand total labeled just "Total
+# liabilities" (= total assets, e.g. Bolloré), which the EU prompt copies
+# verbatim into filing_totals.total_liabilities and the tally then fails by
+# exactly the equity total. Checked BEFORE the EU set below ("france" is in
+# the ESEF set too).
+_BS_FR_PROMPT_COUNTRIES = {
+    "france",
 }
 
 
@@ -4205,6 +4218,11 @@ class FetchFilingRequest(BaseModel):
     # Balance-sheet standardize only: force a fresh run, bypassing the 24h
     # ticker+company_name result cache (the fresh result overwrites the entry).
     refresh: Optional[bool] = False
+    # Direct-URL override: exact report PDF URL. When set, the fetch skips the
+    # IR-site resolver + crawl (and the dedicated-source / EDGAR fallbacks) and
+    # downloads THIS document — for reports the crawl can't reach because they
+    # live on a different domain than the company's resolved IR site.
+    report_url: Optional[str] = None
 
 
 _ARCHIVE_FY_RE = re.compile(r"^FY(\d{4})_(annual|interim)_", re.I)
@@ -4293,6 +4311,13 @@ async def _fetch_filing_pdf(payload: FetchFilingRequest):
     # the pipeline; we run the fetch synchronously below.
     delegated = await handler(Model(**kwargs), BackgroundTasks())
     job_id = delegated["job_id"]
+
+    # Direct-URL override: carry the user-supplied report PDF link onto the job's
+    # source_meta so run_extraction_pipeline hands it to fetch_for_diamond, which
+    # downloads it directly instead of resolving/crawling the IR site.
+    _rurl = (getattr(payload, "report_url", None) or "").strip()
+    if _rurl:
+        JOBS[job_id].setdefault("source_meta", {})["report_url"] = _rurl
 
     JOBS[job_id]["fetch_only"] = True
     # Drop the extraction stages from the job record — they will never run.
@@ -4487,7 +4512,7 @@ async def _bs_run_job(bs_job_id: str, payload: FetchFilingRequest):
     try:
         job_id, pdf_path, job = await _fetch_filing_pdf(payload)
 
-        # European companies get the IFRS prompt (Balance_sheet/prompt_eu.py);
+        # European companies get the IFRS prompt (Balance_sheet/prompts/prompt_eu.py);
         # US and every other market keep the existing prompt. Country comes
         # from the request (exchange-prefixed tickers override it, same rule
         # as routing).
@@ -4495,7 +4520,8 @@ async def _bs_run_job(bs_job_id: str, payload: FetchFilingRequest):
             payload.ticker, payload.country, payload.company_name
         )
         _bs_c = (_bs_country or "").strip().lower()
-        region = ("au" if _bs_c in _BS_AU_PROMPT_COUNTRIES
+        region = ("fr" if _bs_c in _BS_FR_PROMPT_COUNTRIES
+                  else "au" if _bs_c in _BS_AU_PROMPT_COUNTRIES
                   else "eu" if _bs_c in _BS_EU_PROMPT_COUNTRIES
                   else None)
 
@@ -4669,7 +4695,7 @@ async def balance_sheet_excel(payload: FetchFilingRequest):
     /api/fetch-filing for slow markets."""
     from fastapi.concurrency import run_in_threadpool
 
-    from Balance_sheet.raw_excel import run_raw_pipeline
+    from Balance_sheet.excel import run_raw_pipeline
 
     job_id, pdf_path, job = await _fetch_filing_pdf(payload)
 

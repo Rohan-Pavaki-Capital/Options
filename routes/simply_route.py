@@ -125,8 +125,10 @@ def api_simply_grouped(
     _, rows = _scrape(ticker, exchange)
 
     def _series(col):
-        # One {period, value} entry per row that carries this metric, in date order.
-        return [{"period": r["date"], "value": r[col]} for r in rows if col in r]
+        # One {period, value} entry per row that carries this metric, in date
+        # order. FY2029 is excluded so it never appears in the grouped output.
+        return [{"period": r["date"], "value": r[col]}
+                for r in rows if col in r and not r["date"].startswith("2029")]
 
     return {
         "ticker": ticker.upper(),
@@ -134,11 +136,14 @@ def api_simply_grouped(
         "rev_est": _series("revenue"),
         "eps_est": _series("eps"),
         # Standalone combined table (newest-first, top 3 rows only — drops the
-        # reported year), separate from the est series.
+        # reported year), separate from the est series. FY2029 is excluded here
+        # before the top-3 slice, so if 2029 fell in the newest 3 the 4th year
+        # takes its place and the table still returns 3 rows (none for 2029).
         "summary_table": {
             "columns": _TABLE_COLS,
             "headers": _TABLE_HEADERS,
-            "rows": [_summary_row(r) for r in list(reversed(rows))[:3]],
+            "rows": [_summary_row(r) for r in list(reversed(rows))
+                     if not r["date"].startswith("2029")][:3],
         },
     }
 

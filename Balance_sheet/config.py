@@ -46,6 +46,11 @@ TITLE_VARIANTS = [
     # French (ESEF filings are official-language only; e.g. Eiffage's URD).
     # Matching is accent-folded in the locator, so accents here are cosmetic.
     "BILAN CONSOLIDÉ",
+    # French PLURAL — L'Oréal's URD titles the statement "5.3. Bilans
+    # consolidés comparés"; the singular variant above never matches it
+    # (the 's' sits mid-phrase, unlike English "balance sheets" which the
+    # bare variant still substring-matches).
+    "BILANS CONSOLIDÉS",
     "ÉTAT CONSOLIDÉ DE LA SITUATION FINANCIÈRE",
     "ÉTAT DE LA SITUATION FINANCIÈRE CONSOLIDÉE",
     # Eiffage-style URDs title the statement pages just "Actif" / "Capitaux

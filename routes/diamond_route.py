@@ -221,9 +221,51 @@ def _attempt_eu(name, ticker, out, cat, prog):
     return {**info, "diamond_source": "eu"}
 
 
-def _attempt_irscraper(name, ticker, out, cat, prog, country=None, bs_mode=False):
+def _attempt_irscraper(name, ticker, out, cat, prog, country=None, bs_mode=False,
+                       report_url=None):
     from prototypes import ir_resolve_proto as R
     from prototypes import ir_fetch_proto as F
+
+    # DIRECT-URL OVERRIDE (user-supplied report link): the resolver keys on the
+    # registrable domain, so a report hosted on a DIFFERENT domain than the
+    # company's official site (e.g. investors.csl.com vs the resolved
+    # csl.com.au) is unreachable by the IR-homepage crawl. When the caller hands
+    # us the exact PDF URL, skip resolve+crawl entirely: download it and
+    # force-save it (the user picked it explicitly), verifying only that the
+    # bytes are a real, non-empty PDF — the quality gate becomes advisory here.
+    if report_url:
+        outp = Path(out)
+        info = F.inspect_pdf(report_url, report_url, save_path=str(outp),
+                             force_save=True, bs_probe=bs_mode)
+        if not info.get("ok") or not _valid_pdf(outp):
+            raise RuntimeError(
+                f"direct report_url could not be downloaded as a valid PDF "
+                f"({info.get('reason') or info.get('gate_note') or 'unknown'}): "
+                f"{report_url}")
+        # Classify. An interim signal (cover OR URL) WINS over the cover's
+        # annual heuristic: "Half-Year Ended 31 December" trips the annual
+        # "year ended" regex (is_annual=True) even though the doc is a half-year
+        # interim — the "half-year"/"interim"/"quarter" URL marker corrects that.
+        # Unknown -> annual (honest: triggers the quarterly-first "from an annual
+        # filing" warning downstream).
+        url_l = report_url.lower()
+        interim_url = any(k in url_l for k in (
+            "half-year", "half_year", "halfyear", "half year",
+            "interim", "quarter"))
+        if info.get("is_interim") or interim_url:
+            kind = "interim"
+        elif info.get("is_annual"):
+            kind = "annual"
+        else:
+            kind = "annual"
+        form = ("Annual Report" if kind == "annual"
+                else "Interim/Quarterly Report")
+        return {"company": name, "form": form,
+                "report_period": info.get("fiscal_year"),
+                "ir_url": report_url,
+                "resolver_confidence": "DIRECT (user-supplied URL)",
+                "pages": info.get("pages"), "diamond_source": "ir_scraper_direct"}
+
     res = R.resolve(name or "", ticker or "", "", country or "")
     ir_url = res.get("chosen_url")
     if not ir_url:
@@ -310,6 +352,24 @@ _ATTEMPTS = {
 }
 
 
+# Curated DIRECT report-URL overrides: normalized ticker -> exact report PDF URL.
+# For issuers whose reports live on a DIFFERENT registrable domain than their
+# resolved IR site, so the IR-homepage crawl can never reach them — e.g. CSL:
+# official site csl.com.au, but reports on investors.csl.com. Same precedent and
+# rules as the SGX/BMV curated ticker maps: verified entries only.
+#   MAINTENANCE: a pinned URL is a fixed report and goes STALE when the issuer
+#   files a newer one — update the link here (or pass report_url explicitly) when
+#   a fresher report is published. Looked up by full ticker AND by the bare code
+#   after the exchange prefix, so "ASX:CSL" and "CSL" both match.
+_DIRECT_REPORT_URL = {
+    "ASX:CSL": (
+        "https://investors.csl.com/pdf/ce04b6da-f089-42c5-b4f3-ff9b2d1b2fcc/"
+        "Platform/ListPage/"
+        "CSL-Statutory-Accounts-for-the-Half-Year-Ended-31-December.pdf"
+    ),
+}
+
+
 def fetch_for_diamond(
     company_name: str,
     ticker: str,
@@ -320,6 +380,7 @@ def fetch_for_diamond(
     country: Optional[str] = None,
     allow_edgar_fallback: bool = True,
     bs_mode: bool = False,
+    report_url: Optional[str] = None,
 ) -> dict:
     """COUNTRY-ROUTED Diamond (per user request):
       1. If the user-supplied `country` maps to a DEDICATED data-API source
@@ -334,7 +395,28 @@ def fetch_for_diamond(
     company_name = (company_name or "").strip()
     ticker = (ticker or "").strip()
     country = (country or "").strip()
+    report_url = (report_url or "").strip()
+    # Curated pin: fall back to a verified per-ticker report URL when the caller
+    # didn't pass one explicitly (issuers the IR-homepage crawl can't reach).
+    if not report_url and ticker:
+        _bare = ticker.upper().split(":")[-1]
+        for _k, _u in _DIRECT_REPORT_URL.items():
+            if ticker.upper() == _k or _bare == _k.split(":")[-1]:
+                report_url = _u
+                say(f"Diamond: curated direct report_url pinned for {ticker}")
+                break
     errors: list[str] = []
+
+    # 0) DIRECT-URL OVERRIDE: caller supplied the exact report PDF URL. Bypass
+    # country routing, the IR-site resolver, and the EDGAR fallback entirely and
+    # fetch that one document (see _attempt_irscraper's report_url branch).
+    if report_url:
+        say(f"Diamond: direct report_url supplied -> {report_url}")
+        if out.exists():
+            out.unlink()
+        return _attempt_irscraper(company_name, ticker, out, category, progress,
+                                  country or None, bs_mode=bs_mode,
+                                  report_url=report_url)
 
     # 1) Dedicated data-API route — only when the user gave a country that has one.
     src = COUNTRY_TO_SOURCE.get(country.lower()) if country else None

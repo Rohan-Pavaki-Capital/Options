@@ -9,7 +9,7 @@ import logging
 import os
 import re
 
-from . import parser, pdf_locator
+from ..preprocessing import parser, pdf_locator
 
 logger = logging.getLogger("balance_sheet.raw_excel")
 
