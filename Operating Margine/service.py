@@ -46,9 +46,7 @@ async def judge_operating_margin(request: MarginRequest) -> MarginResponse:
             logger.error("ticker=%s llm_error=%s", request.ticker, exc)
             return _error_response(request.ticker, "LLM_CALL_FAILED", str(exc))
         try:
-            judgment = validate_judgment(
-                raw, request.damodaran_us_margin, request.damodaran_global_margin
-            )
+            judgment = validate_judgment(raw, request)
             break
         except JudgmentValidationError as exc:
             last_error = str(exc)
@@ -68,7 +66,7 @@ async def judge_operating_margin(request: MarginRequest) -> MarginResponse:
             latency_ms,
             last_error,
         )
-        return _error_response(request.ticker, "VALIDATION_FAILED", last_error)
+        return _error_response(request.ticker, "llm_rule_violation", last_error)
 
     logger.info(
         "ticker=%s classification=%s target_margin=%.4f latency_ms=%.0f",
@@ -85,6 +83,8 @@ async def judge_operating_margin(request: MarginRequest) -> MarginResponse:
         target_margin=judgment["target_margin"],
         convergence_year=judgment["convergence_year"],
         confidence=judgment["confidence"],
+        margin_driver=judgment["margin_driver"],
+        anchor_bypassed=judgment["anchor_bypassed"],
         damodaran_anchor_used=float(judgment["damodaran_anchor_used"]),
         comps_used=judgment["comps_used"],
         rationale=judgment["rationale"],
